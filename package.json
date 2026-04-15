@@ -1,0 +1,21 @@
+{
+  "name": "satriales",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
+    "@js-sdsl/ordered-map": "^4.4.2",
+    "ethers": "^6.16.0",
+    "viem": "^2.47.6",
+    "commander": "^14.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "prettier": "^3.4.2",
+    "typescript": "^6.0.2"
+  }
+}
