@@ -17,6 +17,12 @@ import { fetchWithRetry } from "../net/fetchWithRetry";
 import { appendFileSync, existsSync, writeFileSync, readFileSync, renameSync, mkdirSync } from "fs";
 import { join } from "path";
 
+/** Pluggable market finder — allows swapping Polymarket for Kalshi */
+export type MarketFinderFn = (options?: {
+  city?: string;
+  daysAhead?: number;
+}) => Promise<WeatherMarket[]>;
+
 // City coordinates for archive API lookups
 const CITY_COORDS: Record<string, [number, number]> = {
   "new york city": [40.7128, -74.0060],
@@ -72,6 +78,10 @@ export interface SimulatorConfig {
   resolveWithNoise: boolean;
   cheapBracketBonus: boolean;  // overweight cheap brackets ($0.01-$0.10)
   maxModelSpreadF: number;     // skip markets where models disagree more than this
+  /** Custom market finder function — defaults to Polymarket's findWeatherMarkets */
+  marketFinder?: MarketFinderFn;
+  /** Exchange label for display/logging */
+  exchange?: "polymarket" | "kalshi";
 }
 
 export interface SimulatorState {
@@ -96,6 +106,7 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   resolveWithNoise: true,
   cheapBracketBonus: true,
   maxModelSpreadF: 4.0,    // skip when models disagree by >4°F
+  exchange: "polymarket",
 };
 
 const RESULTS_DIR = join(import.meta.dir, "../../results");
@@ -116,6 +127,10 @@ interface PersistedState {
   losses: number;
   scansCompleted: number;
   positionCounter: number;
+  /** Markets we've already resolved — never re-buy these */
+  resolvedMarketKeys: string[];
+  /** Markets we've already placed ladders on (open or closed) — prevents duplicate ladders */
+  activeLadderKeys: string[];
   savedAt: string;
 }
 
@@ -127,6 +142,11 @@ export class WeatherSimulator {
   private positionCounter = 0;
   private running = false;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Markets that have been fully resolved — never re-buy these (keyed as "city-date-type") */
+  private resolvedMarketKeys = new Set<string>();
+  /** Markets with active or closed ladders this session — prevents duplicate ladders */
+  private activeLadderKeys = new Set<string>();
 
   // Callbacks for terminal runner
   onLog?: (msg: string, color?: string) => void;
@@ -153,10 +173,30 @@ export class WeatherSimulator {
           scansCompleted: loaded.scansCompleted,
         };
         this.positionCounter = loaded.positionCounter;
+
+        // Rebuild dedup sets from persisted keys + position data
+        if (loaded.resolvedMarketKeys) {
+          for (const key of loaded.resolvedMarketKeys) this.resolvedMarketKeys.add(key);
+        }
+        if (loaded.activeLadderKeys) {
+          for (const key of loaded.activeLadderKeys) this.activeLadderKeys.add(key);
+        }
+        // Also rebuild from actual positions in case state was saved before these fields existed
+        for (const pos of loaded.closedPositions) {
+          const key = `${pos.market.city.toLowerCase()}-${pos.market.date}-${pos.market.type}`;
+          this.resolvedMarketKeys.add(key);
+          this.activeLadderKeys.add(key);
+        }
+        for (const pos of loaded.positions) {
+          const key = `${pos.market.city.toLowerCase()}-${pos.market.date}-${pos.market.type}`;
+          this.activeLadderKeys.add(key);
+        }
+
         this.log(
           `Resumed from state: $${loaded.balance.toFixed(2)} balance, ` +
           `${loaded.positions.length} open positions, ` +
-          `${loaded.wins}W-${loaded.losses}L, saved ${loaded.savedAt}`,
+          `${loaded.wins}W-${loaded.losses}L, ` +
+          `${this.resolvedMarketKeys.size} resolved markets, saved ${loaded.savedAt}`,
           "cyan"
         );
       } else {
@@ -206,6 +246,8 @@ export class WeatherSimulator {
       losses: this.state.losses,
       scansCompleted: this.state.scansCompleted,
       positionCounter: this.positionCounter,
+      resolvedMarketKeys: [...this.resolvedMarketKeys],
+      activeLadderKeys: [...this.activeLadderKeys],
       savedAt: new Date().toISOString(),
     };
 
@@ -357,10 +399,11 @@ export class WeatherSimulator {
     // 1. Check for resolved positions first
     await this.checkResolutions();
 
-    // 2. Find markets
+    // 2. Find markets (uses pluggable finder — Polymarket or Kalshi)
+    const finder = this.config.marketFinder ?? findWeatherMarkets;
     let markets: WeatherMarket[];
     try {
-      markets = await findWeatherMarkets({ daysAhead: this.config.daysAhead });
+      markets = await finder({ daysAhead: this.config.daysAhead });
     } catch (err) {
       this.log(`Scan failed: ${err}`, "red");
       return;
@@ -390,7 +433,19 @@ export class WeatherSimulator {
     let opportunitiesFound = 0;
 
     for (const market of markets) {
-      // Skip if already have positions in this market
+      const marketKey = `${market.city.toLowerCase()}-${market.date}-${market.type}`;
+
+      // Skip if already resolved — prevents the re-buy loop bug
+      if (this.resolvedMarketKeys.has(marketKey)) {
+        continue;
+      }
+
+      // Skip if we already have an active/closed ladder on this market
+      if (this.activeLadderKeys.has(marketKey)) {
+        continue;
+      }
+
+      // Belt-and-suspenders: also check open positions by eventId
       const existingPositions = this.state.positions.filter(
         p => p.market.eventId === market.eventId
       );
@@ -464,6 +519,10 @@ export class WeatherSimulator {
       const ladderGroup = `${market.city}-${market.date}-${market.type}`;
       let ladderCost = 0;
       let ladderLegsOpened = 0;
+
+      // Mark this market as having an active ladder BEFORE placing legs
+      // This prevents duplicate ladders even if the next scan runs before legs are placed
+      this.activeLadderKeys.add(marketKey);
 
       this.log(
         `LADDER ${market.city} ${market.date} (${market.type}) — ` +
@@ -688,6 +747,11 @@ export class WeatherSimulator {
         `(${positions.filter(p => p.status === "won").length} hit / ${positions.length} legs)`,
         ladderColor
       );
+
+      // Mark this market as resolved — NEVER re-buy it
+      const resolvedKey = `${market.city.toLowerCase()}-${market.date}-${market.type}`;
+      this.resolvedMarketKeys.add(resolvedKey);
+      this.activeLadderKeys.add(resolvedKey); // also ensure active set has it
 
       resolved.push(...positions);
     }
