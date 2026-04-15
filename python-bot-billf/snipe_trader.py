@@ -129,6 +129,21 @@ class SnipeHunter:
 
         self.pending: List[PendingTrade] = []
 
+        # External stop signal (set by GUI or embedding code to request a
+        # graceful shutdown). If True, the main loop breaks on its next iter.
+        self.should_stop: bool = False
+        # Pause flag — when True, scan_all is skipped (no new snipes) but
+        # pending resolution continues. Resets to False to resume.
+        self.paused: bool = False
+        # Max seconds to spend draining pending trades on stop (overridable).
+        self.drain_timeout_s: int = 900
+
+        # In-memory ring buffer of recent trade events, consumed by GUIs.
+        # Each entry: dict with keys ts, kind ("FIRE"/"WIN"/"LOSS"/"DROP"),
+        # stage, market, side, price, pnl, bankroll, conviction, move_pct.
+        self.events: List[dict] = []
+        self._events_cap = 200
+
         # Stats
         self.total_snipes = 0
         self.total_wins = 0
@@ -344,6 +359,12 @@ class SnipeHunter:
             f"${cost_dollars:.2f} ({conviction}, spot {move_pct*100:+.2f}%) | "
             f"bank(committed)=${self.bankroll:.2f}"
         )
+        self._push_event({
+            "ts": time.time(), "kind": "FIRE", "stage": stage, "market": market_key,
+            "side": side, "direction": direction, "price": winner_price,
+            "size": cost_dollars, "conviction": conviction, "move_pct": move_pct,
+            "pnl": 0.0, "bankroll": self.bankroll,
+        })
 
         with get_db(self.db_path) as conn:
             save_live_trade(
@@ -454,9 +475,22 @@ class SnipeHunter:
             f"{p.entry_price:.3f} | PnL ${pnl:+.2f} | Bank ${self.bankroll:.2f} | "
             f"WR {wr:.1f}% [{self.total_wins}W/{self.total_snipes - self.total_wins}L]"
         )
+        self._push_event({
+            "ts": time.time(), "kind": "WIN" if won else "LOSS",
+            "stage": stage, "market": market_key, "side": p.side,
+            "direction": p.direction, "price": p.entry_price,
+            "size": p.shares * p.total_cost, "conviction": conviction,
+            "move_pct": None, "pnl": pnl, "bankroll": self.bankroll,
+        })
 
         with get_db(self.db_path) as conn:
             resolve_trade(conn, p.window_id, outcome, pnl, self.bankroll)
+
+    def _push_event(self, ev: dict):
+        """Append a trade event to the bounded in-memory ring buffer."""
+        self.events.append(ev)
+        if len(self.events) > self._events_cap:
+            self.events = self.events[-self._events_cap:]
 
     # --------------------------------------------------------
     # Main loop
@@ -521,6 +555,9 @@ class SnipeHunter:
 
         try:
             while True:
+                if self.should_stop:
+                    log.info("Stop signal received; exiting main loop")
+                    break
                 if max_hours and (time.time() - start_time) / 3600 > max_hours:
                     log.info(f"Time limit reached ({max_hours}h)")
                     break
@@ -534,8 +571,9 @@ class SnipeHunter:
                     self.bankroll = self.config.initial_bankroll
                     self.peak_bankroll = self.config.initial_bankroll
 
-                # Scan for opportunities
-                self.scan_all()
+                # Scan for opportunities (unless paused)
+                if not self.paused:
+                    self.scan_all()
 
                 # Resolve pending (non-blocking)
                 self.resolve_pending()
@@ -577,13 +615,14 @@ class SnipeHunter:
         except KeyboardInterrupt:
             log.info("\nStopped by user")
 
-        # Drain pending before exit
-        log.info(f"\nDraining {len(self.pending)} pending snipes (up to 15 min)...")
-        drain_deadline = time.time() + 900
-        while self.pending and time.time() < drain_deadline:
+        # Drain pending before exit (configurable timeout for GUI shutdown)
+        drain_timeout = self.drain_timeout_s
+        log.info(f"\nDraining {len(self.pending)} pending snipes (up to {drain_timeout}s)...")
+        drain_deadline = time.time() + drain_timeout
+        while self.pending and time.time() < drain_deadline and not self.should_stop:
             self.resolve_pending()
             if self.pending:
-                time.sleep(15)
+                time.sleep(min(15, drain_timeout // 4 or 1))
 
         self._print_summary(start_time, final=True)
 

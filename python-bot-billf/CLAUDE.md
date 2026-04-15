@@ -28,11 +28,15 @@ Conviction-based sizing:
 - Strong (≥0.30% move)    : **15% of bankroll** (25% max cap)
 
 ## Key Files (current)
-- `snipe_trader.py` — **PRIMARY entry point.** v3 bonereaper snipe bot
-- `live_trader.py` — Shared infrastructure (PolymarketFeed, ASSETS, TIMEFRAMES,
-  PendingTrade). Still contains the legacy ML hybrid trader, retained because
-  snipe_trader imports its feed classes. DO NOT run `live_trader.py` directly
-  as the primary strategy — use `snipe_trader.py`.
+- `snipe_gui.py` — **Desktop dashboard.** Runs the hunter in a background
+  thread and shows live state in a dark-themed tkinter window with embedded
+  matplotlib charts. This is what `START_TRADER.bat` launches.
+- `snipe_trader.py` — **Core trading engine.** v3 bonereaper snipe bot. Can
+  still be run headless as a CLI; the GUI imports its `SnipeHunter` class.
+- `live_trader.py` — Shared infrastructure (PolymarketFeed, ASSETS,
+  TIMEFRAMES, PendingTrade). Still contains the legacy ML hybrid trader,
+  retained because snipe_trader imports its feed classes. DO NOT run
+  `live_trader.py` directly as the primary strategy.
 - `config.py` — Central config ($20 bankroll, $1 min bet)
 - `db.py` — SQLite persistence layer
 - `signals.py` — Fee calc, Kelly sizing (used by legacy ML paths)
@@ -41,14 +45,32 @@ Conviction-based sizing:
 
 ## Running (primary)
 ```bash
+# Desktop GUI (what START_TRADER.bat launches)
+python snipe_gui.py                             # Opens dashboard window
+python snipe_gui.py --assets btc --bankroll 50  # Flags forward to hunter
+
+# Headless CLI (no GUI)
 python snipe_trader.py                          # Unlimited, BTC+ETH, 5m+15m
 python snipe_trader.py --hours 8                # Run for 8 hours
 python snipe_trader.py --assets btc --no-15m    # BTC 5m only
 python snipe_trader.py --bankroll 50            # Start with $50
-python snipe_trader.py --db snipe.db            # Separate DB (default)
 ```
 
-The `START_TRADER.bat` launcher points at `snipe_trader.py`.
+## GUI layout
+The desktop dashboard (`snipe_gui.py`) shows:
+- **Header**: bankroll, total P&L, ROI, win rate, peak, drawdown, snipes
+  count, uptime + pause/resume button
+- **Active markets**: live spot price, Polymarket YES/NO prices, spot move
+  since window open, current stage, time to close — for BTC/ETH x 5m/15m
+- **Bankroll curve**: matplotlib line chart of bankroll over time
+- **Pending snipes**: active bets with entry, current Poly price, and
+  mark-to-market unrealized P&L
+- **Stage/conviction P&L bar chart**: breakdown of where profit comes from
+- **Statistics table**: W/L/PnL grouped by stage, conviction, and market
+- **Recent trades log**: scrolling color-coded event feed
+
+Refreshes every 2 seconds. Hunter runs as a daemon thread so closing the
+window cleanly exits the process.
 
 ## Archived: Legacy ML Version
 The earlier ML-based hybrid trader (ensemble/logistic/xgboost/mean-reversion
