@@ -616,7 +616,7 @@ export class WeatherSimulator {
     // Try Open-Meteo archive API first (most reliable for past data)
     try {
       const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${date}&end_date=${date}`;
-      const res = await fetchWithRetry(url, { timeout: 10_000 }, { maxRetries: 1 });
+      const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000, maxRetries: 1 });
       const data = await res.json();
 
       if (data.daily?.time?.length > 0) {
@@ -633,7 +633,7 @@ export class WeatherSimulator {
     // Fallback: try the forecast API (has recent past days via past_days param)
     try {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&past_days=5&forecast_days=1`;
-      const res = await fetchWithRetry(url, { timeout: 10_000 }, { maxRetries: 1 });
+      const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000, maxRetries: 1 });
       const data = await res.json();
 
       if (data.daily?.time) {

@@ -4,7 +4,11 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "kalshi": "bun run src/kalshi/cli.ts",
+    "kalshi:weather": "bun run src/kalshi/cli.ts weather",
+    "kalshi:whale": "bun run src/kalshi/cli.ts whale",
+    "kalshi:both": "bun run src/kalshi/cli.ts both"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",

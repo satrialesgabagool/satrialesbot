@@ -184,7 +184,7 @@ export async function findWeatherMarkets(options?: {
     const promises = batch.map(async (slug) => {
       try {
         const url = `${GAMMA_API}/events?closed=false&limit=1&slug=${slug}`;
-        const res = await fetchWithRetry(url, { timeout: 10_000 });
+        const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000 });
         const events = await res.json();
         if (!Array.isArray(events) || events.length === 0) return null;
         const event = events[0];

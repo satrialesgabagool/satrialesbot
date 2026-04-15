@@ -94,7 +94,7 @@ async function fetchOpenMeteoModel(
 ): Promise<{ date: string; highC: number; lowC: number }[] | null> {
   try {
     const url = `${modelUrl}?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=${Math.min(days + 1, 16)}`;
-    const res = await fetchWithRetry(url, { timeout: 10_000 });
+    const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000 });
     const data = await res.json();
     if (!data.daily) return null;
 
@@ -114,18 +114,15 @@ async function fetchNOAA(lat: number, lon: number): Promise<{ date: string; high
   try {
     // Step 1: Get the forecast grid
     const pointUrl = `https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`;
-    const pointRes = await fetchWithRetry(pointUrl, {
-      timeout: 10_000,
-    }, { maxRetries: 1 });
+    const pointRes = await fetchWithRetry(pointUrl, {}, { timeoutMs: 10_000, maxRetries: 1 });
     const pointData = await pointRes.json();
     const forecastUrl = pointData.properties?.forecast;
     if (!forecastUrl) return null;
 
     // Step 2: Get the forecast
     const fcRes = await fetchWithRetry(forecastUrl, {
-      timeout: 10_000,
       headers: { "User-Agent": "Satriales/1.0 (weather-trading-bot)" },
-    }, { maxRetries: 1 });
+    }, { timeoutMs: 10_000, maxRetries: 1 });
     const fcData = await fcRes.json();
     const periods = fcData.properties?.periods;
     if (!Array.isArray(periods)) return null;
