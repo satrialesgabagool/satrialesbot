@@ -22,6 +22,9 @@ reports/
 *.png
 *.pdf
 
+# Trader log files (regenerated on each run)
+*.log
+
 # ============================================================
 # Node/TypeScript (for TS bot)
 # ============================================================

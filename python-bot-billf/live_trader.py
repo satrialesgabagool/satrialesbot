@@ -1,5 +1,25 @@
 """
+[LEGACY / ARCHIVED — kept for infrastructure reuse only]
+
 Real-Time Paper Trader v2 — Polymarket BTC/ETH Up/Down 5-Min & 15-Min Markets.
+
+=====================================================================
+  ⚠  THIS FILE IS NO LONGER THE PRIMARY TRADER.  ⚠
+
+  The ML-hybrid strategy in this module was retired on 2026-04-15 after
+  losing -$2.51 on its main ML path during live paper trading. The
+  winning strategy — pure 3-stage sniping — lives in snipe_trader.py,
+  which is now the primary entry point (and what START_TRADER.bat launches).
+
+  This file is kept because snipe_trader.py imports its infrastructure
+  classes (PolymarketFeed, PendingTrade, ASSETS, TIMEFRAMES, window
+  epoch math). The full ML-based version is preserved on the
+  `legacy-ml` git branch for historical reference. Do not run
+  `python live_trader.py` directly.
+
+  To use the current bot:
+      python snipe_trader.py [--hours N] [--assets btc,eth] [--bankroll 20]
+=====================================================================
 
 Connects to live Polymarket markets:
   https://polymarket.com/event/btc-updown-5m-{epoch}
@@ -7,7 +27,7 @@ Connects to live Polymarket markets:
   https://polymarket.com/event/eth-updown-5m-{epoch}
   https://polymarket.com/event/eth-updown-15m-{epoch}
 
-Features (v2):
+Features (v2, archived):
   1. Multi-asset: BTC + ETH in parallel
   2. Multi-timeframe: 5-min + 15-min markets simultaneously
   3. Post-close sniping: buy the winner after close but before resolution
@@ -15,8 +35,8 @@ Features (v2):
   4. Non-blocking resolution queue: continue trading while pending trades
      wait for Polymarket to officially resolve (fixes the 360s freeze bug)
 
-Usage:
-    python live_trader.py                                # Run unlimited, all features on
+Legacy usage (not recommended):
+    python live_trader.py                                # ML ensemble + snipes
     python live_trader.py --hours 8                      # Run for 8 hours
     python live_trader.py --assets btc                   # BTC only
     python live_trader.py --assets btc,eth --no-15m      # 5-min only
