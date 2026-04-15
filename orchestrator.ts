@@ -15,7 +15,7 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, rmS
 import { join } from "path";
 
 // --- Configuration ---
-const STRATEGIES = ["simulation", "signal-momentum", "latency-arb"];
+const STRATEGIES = ["simulation", "signal-momentum", "latency-arb", "observer"];
 const ROUNDS_PER_BATCH = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--rounds-per-batch") ?? "2");
 const MAX_ITERATIONS = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--iterations") ?? "50");
 const STATE_DIR = join(import.meta.dir, "state");
