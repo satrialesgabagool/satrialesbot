@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+state/*.json
+state/*.lock
+logs/*.log
+logs/*.ndjson
+results/
+*.lock
+.DS_Store
