@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# SQLite databases (trading data — regenerated on run)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Generated reports
+reports/
+*.png
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude/agent state
+.claude/
+CLAUDE.local.md
+
+# Backups
+*.bak
+*.tmp
