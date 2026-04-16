@@ -50,6 +50,7 @@ export class HighConvictionLog {
   }
 
   append(row: HighConvictionRow): void {
+    // CSV for Excel / pandas analysis
     const line =
       [
         row.timestamp,
@@ -65,6 +66,10 @@ export class HighConvictionLog {
         csvEscape(JSON.stringify(row.metadata)),
       ].join(",") + "\n";
     appendFileSync(this.path, line);
+
+    // JSONL for the web dashboard (same data, structured format)
+    const jsonlPath = this.path.replace(/\.csv$/, ".jsonl");
+    appendFileSync(jsonlPath, JSON.stringify(row) + "\n");
   }
 }
 
