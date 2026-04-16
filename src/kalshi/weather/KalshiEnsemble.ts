@@ -23,6 +23,7 @@ import {
   fetchEnsembleForecast,
   ensembleBracketProbability,
 } from "../../weather/WeatherEnsemble";
+import { fetchGFSEnsemble } from "../../weather/GFSEnsemble";
 import { loadPaidSources, type ForecastSource, type DailyTempForecast } from "./sources";
 
 /**
@@ -56,6 +57,16 @@ export interface KalshiEnsembleDay {
   agreement: number;
   sources: SourceSample[];
   sourceCount: number;
+  /**
+   * Full GEFS 31-member distribution for the day's high (°F), when available.
+   * Consumers prefer this over (mean, spread) because it captures the real
+   * shape of the forecast distribution — fat tails, bimodality, skew — that
+   * the Gaussian approximation misses. Absent when Open-Meteo's ensemble API
+   * errored or the city isn't covered.
+   */
+  highFMembers?: number[];
+  /** Same as highFMembers but for daily lows. Used by KXLOW markets. */
+  lowFMembers?: number[];
 }
 
 export interface KalshiEnsembleForecast {
@@ -90,12 +101,19 @@ export async function fetchKalshiEnsemble(
   // abbreviations via their own CITY_COORDS.
   const resolvedCity = CITY_ALIASES[city.toLowerCase()] ?? city;
 
-  // 1. Free-tier ensemble (Open-Meteo models + NOAA NWS for US cities).
-  const free = await fetchEnsembleForecast(resolvedCity, daysAhead);
-
-  // 2. Paid sources in parallel, filtering to configured ones only.
+  // 1-3. Fetch free-tier, GFS 31-member, and paid sources in parallel.
+  //   - free:   Open-Meteo single-value models (ecmwf, gfs, best_match) + NOAA NWS
+  //   - gfs:    Full GEFS 31-member ensemble via Open-Meteo ensemble-api
+  //   - paid:   Configured paid APIs (OpenWeather, Tomorrow.io, etc.)
+  // GFS 31-member is additive — its daily mean *also* participates as one
+  // "source" in the point-mean calculation, but the full member array is
+  // carried through for empirical bracket-probability computation.
   const activePaid = extraSources.filter((s) => s.isConfigured());
-  const paidResults = await Promise.all(activePaid.map((s) => s.fetch(city, daysAhead)));
+  const [free, gfs, ...paidResults] = await Promise.all([
+    fetchEnsembleForecast(resolvedCity, daysAhead),
+    fetchGFSEnsemble(resolvedCity, daysAhead),
+    ...activePaid.map((s) => s.fetch(city, daysAhead)),
+  ]);
 
   // Collect per-date samples from all sources.
   const byDate = new Map<string, SourceSample[]>();
@@ -117,6 +135,30 @@ export async function fetchKalshiEnsemble(
     }
   }
 
+  // GFS 31-member: add the member mean as one more "source" for the
+  // aggregated mean/spread, AND keep the full member array keyed by date
+  // so the day object can carry it through to bracket-probability math.
+  const gfsMembersByDate = new Map<string, { highF: number[]; lowF: number[] }>();
+  if (gfs) {
+    for (const d of gfs.days) {
+      const highMean = d.highF_members.length > 0
+        ? d.highF_members.reduce((a, b) => a + b, 0) / d.highF_members.length
+        : NaN;
+      const lowMean = d.lowF_members.length > 0
+        ? d.lowF_members.reduce((a, b) => a + b, 0) / d.lowF_members.length
+        : NaN;
+      if (isFinite(highMean) && isFinite(lowMean)) {
+        if (!byDate.has(d.date)) byDate.set(d.date, []);
+        byDate.get(d.date)!.push({
+          source: "gfs-ensemble(31m)",
+          highF: Math.round(highMean * 10) / 10,
+          lowF: Math.round(lowMean * 10) / 10,
+        });
+      }
+      gfsMembersByDate.set(d.date, { highF: d.highF_members, lowF: d.lowF_members });
+    }
+  }
+
   if (byDate.size === 0) return null;
 
   const days: KalshiEnsembleDay[] = [];
@@ -129,6 +171,7 @@ export async function fetchKalshiEnsemble(
     const ensembleLowF = mean(lows);
     const spreadHighF = stddev(highs);
     const spreadLowF = stddev(lows);
+    const gfsMembers = gfsMembersByDate.get(date);
     days.push({
       date,
       ensembleHighF: Math.round(ensembleHighF * 10) / 10,
@@ -138,6 +181,8 @@ export async function fetchKalshiEnsemble(
       agreement: Math.round(agreementScore(spreadHighF) * 100) / 100,
       sources: samples,
       sourceCount: samples.length,
+      highFMembers: gfsMembers?.highF,
+      lowFMembers: gfsMembers?.lowF,
     });
   }
 

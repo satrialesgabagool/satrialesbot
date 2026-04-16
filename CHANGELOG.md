@@ -5,6 +5,7 @@ High-level project history. For per-commit detail see `git log`.
 ## [Gas-bot] Unreleased — 2026-04-16
 
 ### Added
+- **GFS 31-member ensemble** (`src/weather/GFSEnsemble.ts`) — pulls the full GEFS distribution (1 control + 30 perturbed) from Open-Meteo's ensemble-api. `KalshiEnsembleDay` now carries an optional `highFMembers: number[]`, and `ensembleBracketProbability()` uses an empirical count-based probability (with Laplace smoothing) when members are present instead of forcing a Gaussian. Live NYC smoke test confirms ~10 pp probability differences from Gaussian on tail brackets — real fat-tail and skew info the previous math was missing. Scanner signals now tag `metadata.probMethod = "empirical-gfs31" | "gaussian"` so we can measure which path is firing.
 - **Web dashboard** (`src/dashboard/`) — Hono + Bun server on :3000 with 4 live tabs:
   - Live Feed (SSE stream of scanner signals)
   - Backtest (configurable city/edge/size params, Open-Meteo archive)

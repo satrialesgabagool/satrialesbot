@@ -26,10 +26,10 @@ For each city:
   5. Emit signal with reason string: "NYC high 2026-04-16 [72-74°F]: model=24% vs market=11%, edge=1300bp"
 ```
 
-## Expansion targets (planned, not yet implemented)
+## Expansion targets
 
-- **GFS 31-member ensemble** — Open-Meteo's `ensemble_members` endpoint returns all GEFS members, not just point means. This gives true distribution rather than assumed Gaussian.
-- **NOAA METAR same-day lock** — once observed airport temp is within 1-2°F of sunset forecast, bracket outcome is near-certain. Real-time obs from `aviationweather.gov` (no key needed).
+- **✅ GFS 31-member ensemble** — shipped. `fetchKalshiEnsemble()` now pulls the full GEFS distribution via `src/weather/GFSEnsemble.ts`. Each `KalshiEnsembleDay` optionally carries `highFMembers: number[]` (31 members when available). When present, the scanner routes through empirical bracket probability (`count(members in bracket) / n` with Laplace smoothing) instead of the Gaussian approximation — captures fat tails and skew.
+- **NOAA METAR same-day lock** (planned) — once observed airport temp is within 1-2°F of sunset forecast, bracket outcome is near-certain. Real-time obs from `aviationweather.gov` (no key needed).
 
 ## Config knobs (`SimulatorConfig`)
 

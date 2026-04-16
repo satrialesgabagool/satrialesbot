@@ -130,8 +130,13 @@ export class WeatherScanner {
   ): HighConvictionRow | null {
     const ensembleMean = market.type === "high" ? day.ensembleHighF : day.ensembleLowF;
     const spread = market.type === "high" ? day.spreadHighF : day.spreadLowF;
+    // GFS 31-member distribution for this day+side, if available. When
+    // present the probability is computed empirically (count of members
+    // in bracket) instead of from the Gaussian approximation — captures
+    // fat tails and skew the Gaussian misses.
+    const members = market.type === "high" ? day.highFMembers : day.lowFMembers;
 
-    const trueProb = bracketProbability(ensembleMean, spread, b.lowF, b.highF, hoursLeft);
+    const trueProb = bracketProbability(ensembleMean, spread, b.lowF, b.highF, hoursLeft, members);
     const marketProb = b.outcomePrices[0];
     const edge = trueProb - marketProb;
     const edgeBps = Math.round(edge * 10000);
@@ -168,6 +173,9 @@ export class WeatherScanner {
         marketProb: Math.round(marketProb * 10000) / 10000,
         volume24h: b.volume,
         liquidity: b.liquidity,
+        // Which probability path fired, for after-the-fact analysis.
+        probMethod: members && members.length >= 10 ? "empirical-gfs31" : "gaussian",
+        gfsMembers: members?.length ?? 0,
       },
     };
   }
