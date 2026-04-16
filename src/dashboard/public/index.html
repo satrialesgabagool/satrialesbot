@@ -1167,13 +1167,14 @@
       const section = document.getElementById('btResults');
       section.classList.add('visible');
 
-      // Summary cards
-      const totalTrades = data.trades ? data.trades.length : 0;
-      const wins = data.trades ? data.trades.filter(t => t.won).length : 0;
+      // Summary cards — API returns { summary: {...}, trades: [...], equityCurve: [...] }
+      const s = data.summary || {};
+      const totalTrades = s.totalTrades || (data.trades ? data.trades.length : 0);
+      const wins = s.wins || 0;
       const winRate = totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(1) : '0.0';
-      const totalPnl = data.totalPnl != null ? data.totalPnl : 0;
-      const roi = data.roi != null ? data.roi : 0;
-      const avgPnl = totalTrades > 0 ? (totalPnl / totalTrades) : 0;
+      const totalPnl = s.totalPnl != null ? s.totalPnl : 0;
+      const roi = s.roi != null ? (s.roi * 100) : 0;
+      const avgPnl = s.avgPnlPerTrade != null ? s.avgPnlPerTrade : (totalTrades > 0 ? (totalPnl / totalTrades) : 0);
 
       document.getElementById('btTotalTrades').textContent = totalTrades;
       document.getElementById('btWinRate').textContent = winRate + '%';
@@ -1205,10 +1206,10 @@
       if (!data.equityCurve || data.equityCurve.length === 0) return;
 
       const chartData = {
-        labels: data.equityCurve.map((_, i) => i),
+        labels: data.equityCurve.map((p, i) => i),
         datasets: [{
           label: 'Balance',
-          data: data.equityCurve,
+          data: data.equityCurve.map(p => p.balance),
           borderColor: '#3fb950',
           backgroundColor: 'rgba(63, 185, 80, 0.1)',
           fill: true,
@@ -1246,6 +1247,16 @@
     }
 
     function renderBtErrorHistogram(data) {
+      // Compute forecast errors from trades (modelProb - entryPrice as proxy)
+      // or use accuracy.overall if available
+      if (!data.trades || data.trades.length === 0) return;
+      data.errors = data.trades.filter(t => t.actualHighF != null && t.bracket).map(t => {
+        // Parse bracket like "48-49°F" to get midpoint, compare to actual
+        const match = t.bracket.match(/(\d+)-(\d+)/);
+        if (!match) return 0;
+        const mid = (parseInt(match[1]) + parseInt(match[2])) / 2;
+        return t.actualHighF - mid;
+      });
       if (!data.errors || data.errors.length === 0) return;
 
       // Create histogram buckets from -6 to +6
@@ -1298,9 +1309,10 @@
       const tbody = document.getElementById('btAccuracyBody');
       tbody.innerHTML = '';
 
-      if (!data.cityAccuracy) return;
+      const cityAccuracy = (data.accuracy && data.accuracy.byCity) || data.cityAccuracy || [];
+      if (cityAccuracy.length === 0) return;
 
-      for (const row of data.cityAccuracy) {
+      for (const row of cityAccuracy) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${row.city}</td>
@@ -1329,10 +1341,10 @@
           <td>${t.date || '-'}</td>
           <td>${t.city || '-'}</td>
           <td style="font-family:monospace;font-size:12px">${t.bracket || '-'}</td>
-          <td>${t.entry != null ? t.entry.toFixed(2) : '-'}</td>
+          <td>${t.entryPrice != null ? t.entryPrice.toFixed(2) : (t.entry != null ? t.entry.toFixed(2) : '-')}</td>
           <td>${t.modelProb != null ? t.modelProb.toFixed(3) : '-'}</td>
           <td class="edge-positive">${t.edge != null ? t.edge.toFixed(3) : '-'}</td>
-          <td>${t.actual != null ? t.actual + 'F' : '-'}</td>
+          <td>${t.actualHighF != null ? t.actualHighF + '°F' : (t.actual != null ? t.actual + '°F' : '-')}</td>
           <td class="${resultClass}">${resultText}</td>
           <td class="${t.pnl >= 0 ? 'result-won' : 'result-lost'}">${pnlSign}$${t.pnl != null ? t.pnl.toFixed(2) : '0.00'}</td>
         `;
@@ -1574,15 +1586,16 @@
       document.getElementById('accCharts').style.display = 'grid';
       document.getElementById('accTableWrap').style.display = 'block';
 
-      // Summary cards
+      // Summary cards — API returns { overall: {mae, stddev, within2F, within4F, ...}, comparisons: [...], byCity: [...] }
+      const ov = data.overall || {};
       document.getElementById('accMae').textContent =
-        data.mae != null ? data.mae.toFixed(2) + 'F' : '-';
+        ov.mae != null ? ov.mae.toFixed(2) + '°F' : '-';
       document.getElementById('accStddev').textContent =
-        data.stddev != null ? data.stddev.toFixed(2) + 'F' : '-';
+        ov.stddev != null ? ov.stddev.toFixed(2) + '°F' : '-';
       document.getElementById('accWithin2').textContent =
-        data.within2F != null ? data.within2F.toFixed(1) + '%' : '-';
+        ov.within2F != null ? (ov.within2F * 100).toFixed(1) + '%' : '-';
       document.getElementById('accWithin4').textContent =
-        data.within4F != null ? data.within4F.toFixed(1) + '%' : '-';
+        ov.within4F != null ? (ov.within4F * 100).toFixed(1) + '%' : '-';
 
       // Scatter chart
       renderAccScatter(data);
@@ -1595,21 +1608,22 @@
     }
 
     function renderAccScatter(data) {
-      if (!data.forecasts || data.forecasts.length === 0) return;
+      const comparisons = data.comparisons || data.forecasts || [];
+      if (comparisons.length === 0) return;
 
       // City color map
       const cityColors = {
-        NYC: '#58a6ff', Chicago: '#3fb950', Miami: '#f0883e', LA: '#bc8cff',
-        Dallas: '#d29922', Seattle: '#79c0ff', Atlanta: '#f85149', Denver: '#a5d6ff',
-        Boston: '#d2a8ff',
+        'New York City': '#58a6ff', Chicago: '#3fb950', Miami: '#f0883e',
+        'Los Angeles': '#bc8cff', Dallas: '#d29922', Seattle: '#79c0ff',
+        Atlanta: '#f85149', Denver: '#a5d6ff', Boston: '#d2a8ff',
       };
 
       // Group by city for separate datasets
       const byCityMap = {};
-      for (const f of data.forecasts) {
+      for (const f of comparisons) {
         const city = f.city || 'Unknown';
         if (!byCityMap[city]) byCityMap[city] = [];
-        byCityMap[city].push({ x: f.forecastHigh, y: f.actualHigh });
+        byCityMap[city].push({ x: f.forecastHighF ?? f.forecastHigh, y: f.actualHighF ?? f.actualHigh });
       }
 
       const datasets = Object.entries(byCityMap).map(([city, points]) => ({
@@ -1621,7 +1635,7 @@
       }));
 
       // Find range for reference line
-      const allVals = data.forecasts.flatMap(f => [f.forecastHigh, f.actualHigh]);
+      const allVals = comparisons.flatMap(f => [f.forecastHighF ?? f.forecastHigh, f.actualHighF ?? f.actualHigh]);
       const minVal = Math.floor(Math.min(...allVals) - 2);
       const maxVal = Math.ceil(Math.max(...allVals) + 2);
 
@@ -1675,7 +1689,9 @@
     }
 
     function renderAccErrorHist(data) {
-      if (!data.errors || data.errors.length === 0) return;
+      // Extract errors from comparisons if not provided directly
+      const errors = data.errors || (data.comparisons || []).map(c => c.errorF).filter(e => e != null);
+      if (!errors || errors.length === 0) return;
 
       const bucketLabels = [];
       const bucketCounts = [];
@@ -1684,7 +1700,7 @@
         bucketCounts.push(0);
       }
 
-      for (const err of data.errors) {
+      for (const err of errors) {
         const rounded = Math.round(err);
         const idx = rounded + 6;
         if (idx >= 0 && idx < bucketCounts.length) {
@@ -1726,19 +1742,20 @@
       const tbody = document.getElementById('accCityBody');
       tbody.innerHTML = '';
 
-      if (!data.cityBreakdown) return;
+      const cityData = data.byCity || data.cityBreakdown || [];
+      if (cityData.length === 0) return;
 
-      for (const row of data.cityBreakdown) {
+      for (const row of cityData) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td>${row.city}</td>
           <td>${row.n}</td>
-          <td>${row.meanError != null ? row.meanError.toFixed(2) + 'F' : '-'}</td>
-          <td>${row.stddev != null ? row.stddev.toFixed(2) + 'F' : '-'}</td>
-          <td>${row.mae != null ? row.mae.toFixed(2) + 'F' : '-'}</td>
-          <td>${row.maxError != null ? row.maxError.toFixed(2) + 'F' : '-'}</td>
-          <td>${row.within2F != null ? row.within2F.toFixed(1) + '%' : '-'}</td>
-          <td>${row.within4F != null ? row.within4F.toFixed(1) + '%' : '-'}</td>
+          <td>${row.meanError != null ? row.meanError.toFixed(2) + '°F' : '-'}</td>
+          <td>${row.stddev != null ? row.stddev.toFixed(2) + '°F' : '-'}</td>
+          <td>${row.mae != null ? row.mae.toFixed(2) + '°F' : '-'}</td>
+          <td>${row.maxAbsError != null ? row.maxAbsError.toFixed(2) + '°F' : (row.maxError != null ? row.maxError.toFixed(2) + '°F' : '-')}</td>
+          <td>${row.within2F != null ? (row.within2F * 100).toFixed(1) + '%' : '-'}</td>
+          <td>${row.within4F != null ? (row.within4F * 100).toFixed(1) + '%' : '-'}</td>
         `;
         tbody.appendChild(tr);
       }
