@@ -8,3 +8,6 @@ logs/*.ndjson
 results/
 *.lock
 .DS_Store
+.claude/
+.vscode/
+.idea/
