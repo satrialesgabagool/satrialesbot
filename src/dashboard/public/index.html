@@ -1425,15 +1425,22 @@
       document.getElementById('simOpenCount').textContent = openCount;
       document.getElementById('simScans').textContent = scans;
 
-      // Track equity for chart
-      simEquityData.push(balance);
-      updateSimEquityChart();
+      // Track equity for chart — cap at 200 points to prevent chart lag
+      // Only add a new point if balance actually changed (avoid duplicate ticks from countdown updates)
+      const lastPoint = simEquityData[simEquityData.length - 1];
+      if (lastPoint == null || Math.abs(lastPoint - balance) > 0.001) {
+        simEquityData.push(balance);
+        if (simEquityData.length > 200) {
+          simEquityData.shift();
+        }
+        updateSimEquityChart();
+      }
 
       // Open positions table
       renderSimOpenPositions(state.positions || []);
 
-      // Closed positions table
-      renderSimClosedPositions(state.closedPositions || []);
+      // Closed positions table (cap displayed rows for perf)
+      renderSimClosedPositions((state.closedPositions || []).slice(-50));
     }
 
     function updateSimEquityChart() {
@@ -1455,7 +1462,7 @@
 
       if (simEquityChart) {
         simEquityChart.data = chartData;
-        simEquityChart.update();
+        simEquityChart.update('none'); // skip animation for perf
       } else {
         simEquityChart = new Chart(document.getElementById('simEquityChart'), {
           type: 'line',

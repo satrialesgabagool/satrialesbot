@@ -9,7 +9,9 @@
     "kalshi:weather": "bun run src/kalshi/cli.ts weather",
     "kalshi:whale": "bun run src/kalshi/cli.ts whale",
     "kalshi:both": "bun run src/kalshi/cli.ts both",
-    "dashboard": "bun run src/dashboard/server.ts"
+    "dashboard": "bun run src/dashboard/server.ts",
+    "paper-trade": "bun run src/dashboard/paper-trader.ts",
+    "demo": "bun run src/dashboard/seed-demo.ts"
   },
   "dependencies": {
     "@js-sdsl/ordered-map": "^4.4.2",
