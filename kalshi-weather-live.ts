@@ -101,7 +101,8 @@ ${c.blue}${c.bold}  ╔═══════════════════
   ${c.dim}Days ahead:${c.reset}        ${DAYS_AHEAD}
   ${c.dim}Models:${c.reset}            Open-Meteo + ECMWF + GFS + NOAA
   ${c.dim}Max model spread:${c.reset}  ±${MAX_SPREAD.toFixed(0)}°F
-  ${c.dim}Sizing:${c.reset}            Edge-weighted, 2x bonus on brackets ≤$0.10
+  ${c.dim}Min bracket:${c.reset}       $0.03 (skip penny brackets)
+  ${c.dim}Sizing:${c.reset}            Edge-weighted, mild bonus on cheap brackets
   ${c.dim}Resolution:${c.reset}        ${INSTANT_RESOLVE ? "Instant (needs past dates)" : "NWS Daily Climate Report (sim: Open-Meteo archive)"}
   ${c.dim}State:${c.reset}             ${FRESH_START ? "Fresh start" : WeatherSimulator.hasSavedState() ? "Resuming from saved state" : "New session"}
   ${c.dim}State file:${c.reset}        state/weather-sim.json
@@ -245,6 +246,8 @@ async function main() {
     resolveWithNoise: true,
     cheapBracketBonus: true,
     maxModelSpreadF: MAX_SPREAD,
+    minBracketPrice: 0.03,    // skip $0.01-$0.02 penny brackets (no real liquidity)
+    minYesBid: 0,             // Kalshi penny markets have no bids — rely on price filter
     marketFinder: kalshiFinder,
     exchange: "kalshi",
   }, RESUME);

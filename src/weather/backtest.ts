@@ -31,7 +31,7 @@ function cToF(c: number): number {
 // ─── Fetch actual recorded temps ─────────────────────────────────────
 async function fetchActuals(city: string, coords: [number, number], startDate: string, endDate: string) {
   const url = `${ARCHIVE_API}?latitude=${coords[0]}&longitude=${coords[1]}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${startDate}&end_date=${endDate}`;
-  const res = await fetchWithRetry(url, { timeout: 15_000 });
+  const res = await fetchWithRetry(url, {}, { timeoutMs: 15_000 });
   const data = await res.json();
   if (!data.daily) return null;
 
@@ -47,7 +47,7 @@ async function fetchActuals(city: string, coords: [number, number], startDate: s
 // ─── Fetch forecast (includes recent past days) ──────────────────────
 async function fetchForecasts(coords: [number, number], days: number) {
   const url = `${FORECAST_API}?latitude=${coords[0]}&longitude=${coords[1]}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&past_days=7&forecast_days=${days}`;
-  const res = await fetchWithRetry(url, { timeout: 15_000 });
+  const res = await fetchWithRetry(url, {}, { timeoutMs: 15_000 });
   const data = await res.json();
   if (!data.daily) return null;
 

@@ -78,6 +78,10 @@ export interface SimulatorConfig {
   resolveWithNoise: boolean;
   cheapBracketBonus: boolean;  // overweight cheap brackets ($0.01-$0.10)
   maxModelSpreadF: number;     // skip markets where models disagree more than this
+  /** Minimum bracket price to consider (skip penny brackets with no liquidity) */
+  minBracketPrice: number;
+  /** Minimum yes_bid required (ensures there's a real buyer — 0 means no ask) */
+  minYesBid: number;
   /** Custom market finder function — defaults to Polymarket's findWeatherMarkets */
   marketFinder?: MarketFinderFn;
   /** Exchange label for display/logging */
@@ -106,6 +110,8 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   resolveWithNoise: true,
   cheapBracketBonus: true,
   maxModelSpreadF: 4.0,    // skip when models disagree by >4°F
+  minBracketPrice: 0.03,   // skip $0.01-$0.02 brackets (no real liquidity)
+  minYesBid: 0,            // 0 = don't filter by bid (Kalshi penny markets have no bids)
   exchange: "polymarket",
 };
 
@@ -348,8 +354,10 @@ export class WeatherSimulator {
     let totalWeight = 0;
     const weighted = candidates.map(c => {
       const price = c.bracket.outcomePrices[0];
-      const cheapBonus = this.config.cheapBracketBonus && price <= 0.10 ? 2.0
-        : this.config.cheapBracketBonus && price <= 0.20 ? 1.5
+      // Mild bonus for cheaper brackets — reduced from 2.0/1.5 to 1.3/1.15
+      // after live sim showed penny brackets had phantom liquidity and amplified losses
+      const cheapBonus = this.config.cheapBracketBonus && price <= 0.10 ? 1.3
+        : this.config.cheapBracketBonus && price <= 0.20 ? 1.15
         : 1.0;
       const weight = c.edge * cheapBonus;
       totalWeight += weight;
@@ -496,6 +504,15 @@ export class WeatherSimulator {
         // Skip dead brackets
         if (marketPrice < 0.005 || marketPrice > 0.95) continue;
 
+        // Liquidity filter: skip penny brackets with no real market
+        // On Kalshi, $0.01 brackets typically have yes_bid=$0.00 — nobody is
+        // actually offering to sell at that price. The "edge" is an illusion.
+        if (marketPrice < this.config.minBracketPrice) continue;
+
+        // Optional bid-side filter: if the bracket has _yesBid data, check it
+        const yesBid = (bracket as any)._yesBid;
+        if (this.config.minYesBid > 0 && typeof yesBid === "number" && yesBid < this.config.minYesBid) continue;
+
         const edge = prob - marketPrice;
         if (edge >= this.config.minEdge) {
           candidates.push({ bracket, prob, edge });
@@ -616,7 +633,7 @@ export class WeatherSimulator {
     // Try Open-Meteo archive API first (most reliable for past data)
     try {
       const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${date}&end_date=${date}`;
-      const res = await fetchWithRetry(url, { timeout: 10_000 }, { maxRetries: 1 });
+      const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000, maxRetries: 1 });
       const data = await res.json();
 
       if (data.daily?.time?.length > 0) {
@@ -633,7 +650,7 @@ export class WeatherSimulator {
     // Fallback: try the forecast API (has recent past days via past_days param)
     try {
       const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&past_days=5&forecast_days=1`;
-      const res = await fetchWithRetry(url, { timeout: 10_000 }, { maxRetries: 1 });
+      const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000, maxRetries: 1 });
       const data = await res.json();
 
       if (data.daily?.time) {
