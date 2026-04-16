@@ -9,7 +9,7 @@
  * so memory is bounded by `baselineWindowMs / avg_trade_spacing`.
  */
 
-import type { KalshiTrade } from "../client/types";
+import type { KalshiTrade } from "../types";
 import type { MarketWindow } from "./types";
 
 interface MarketBuffer {

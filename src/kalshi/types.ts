@@ -178,6 +178,23 @@ export interface GetPositionsResponse {
   event_positions: KalshiEventPosition[];
 }
 
+// ─── Trades ────────────────────────────────────────────────────────
+
+export interface KalshiTrade {
+  trade_id: string;
+  ticker: string;
+  count: number;              // contracts
+  yes_price: number;          // cents
+  no_price: number;           // cents
+  taker_side: "yes" | "no";   // which side hit the book
+  created_time: string;       // ISO8601
+}
+
+export interface GetTradesResponse {
+  trades: KalshiTrade[];
+  cursor: string;
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /** Parse FixedPointDollars string to number */

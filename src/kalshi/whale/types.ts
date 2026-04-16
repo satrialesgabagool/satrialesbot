@@ -10,7 +10,7 @@
  *    is the dollar cost of the YES side)
  */
 
-import type { KalshiTrade } from "../client/types";
+import type { KalshiTrade } from "../types";
 
 export interface MarketWindow {
   ticker: string;

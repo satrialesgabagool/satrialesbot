@@ -14,7 +14,7 @@
  * but disabled in paper mode.
  */
 
-import { ReconnectingWebSocket } from "../../net/ReconnectingWebSocket";
+import { ReconnectingWebSocket } from "../net/ReconnectingWebSocket";
 import type { KalshiClient } from "./KalshiClient";
 
 export type KalshiChannel =
@@ -57,8 +57,8 @@ export class KalshiWS {
         this.opts.onOpen?.();
       },
       onClose: () => this.opts.onClose?.(),
-      onError: (e) => this.opts.onError?.(e),
-      onMessage: (data) => {
+      onError: (e: Error) => this.opts.onError?.(e),
+      onMessage: (data: string | Buffer) => {
         try {
           const parsed = JSON.parse(typeof data === "string" ? data : data.toString()) as KalshiWSMessage;
           this.opts.onMessage(parsed);

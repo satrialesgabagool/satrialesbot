@@ -17,18 +17,16 @@
 
 import { Command } from "commander";
 import { join } from "path";
-import { KalshiClient } from "./client/KalshiClient";
+import { KalshiClient } from "./KalshiClient";
+import { loadCredentialsFromEnv } from "./KalshiAuth";
 import { HighConvictionLog } from "./output/HighConvictionLog";
 import { WeatherScanner, DEFAULT_WEATHER_SCANNER_CONFIG } from "./weather/WeatherScanner";
 import { WhaleScanner, DEFAULT_WHALE_SCANNER_CONFIG } from "./whale/WhaleScanner";
 
 function buildClient(): KalshiClient {
-  const env = (process.env.KALSHI_ENV as "demo" | "prod" | undefined) ?? "demo";
-  return new KalshiClient({
-    env,
-    accessKey: process.env.KALSHI_ACCESS_KEY,
-    privateKeyPem: process.env.KALSHI_PRIVATE_KEY_PEM,
-  });
+  const demo = (process.env.KALSHI_ENV ?? "demo") === "demo";
+  const creds = loadCredentialsFromEnv() ?? undefined;
+  return new KalshiClient({ demo, credentials: creds });
 }
 
 function buildLog(): HighConvictionLog {
@@ -75,7 +73,7 @@ program
     header();
     const client = buildClient();
     const log = buildLog();
-    const scanner = new WeatherScanner(client, log, {
+    const scanner = new WeatherScanner(log, {
       ...DEFAULT_WEATHER_SCANNER_CONFIG,
       minEdgeBps: parseInt(opts.minEdgeBps, 10),
       maxSpreadF: parseFloat(opts.maxSpread),
@@ -127,7 +125,7 @@ program
     header();
     const client = buildClient();
     const log = buildLog();
-    const weather = new WeatherScanner(client, log);
+    const weather = new WeatherScanner(log);
     const whale = new WhaleScanner(client, log);
     wireShutdown([() => weather.stop(), () => whale.stop()]);
     await Promise.all([weather.start(), whale.start()]);

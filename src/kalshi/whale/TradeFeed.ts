@@ -12,9 +12,9 @@
  * double-count.
  */
 
-import type { KalshiClient } from "../client/KalshiClient";
-import { KalshiWS } from "../client/KalshiWS";
-import type { KalshiTrade } from "../client/types";
+import type { KalshiClient } from "../KalshiClient";
+import { KalshiWS } from "../KalshiWS";
+import type { KalshiTrade } from "../types";
 
 export type TradeHandler = (trade: KalshiTrade) => void;
 
@@ -85,7 +85,7 @@ export class TradeFeed {
     // supports `min_ts` (seconds) and returns in descending order by default.
     const tickers = this.opts.tickers && this.opts.tickers.length > 0 ? this.opts.tickers : [undefined];
     for (const ticker of tickers) {
-      for await (const trade of this.client.paginateTrades({ ticker, minTs: this.lastPollTs })) {
+      for await (const trade of this.client.paginateTrades({ ticker, min_ts: this.lastPollTs })) {
         if (this.seen.has(trade.trade_id)) continue;
         this.seen.set(trade.trade_id, Date.now());
         for (const h of this.handlers) h(trade);

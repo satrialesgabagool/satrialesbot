@@ -16,7 +16,7 @@ import { mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { KalshiClient } from "./client/KalshiClient";
+import { KalshiClient } from "./KalshiClient";
 import { fetchKalshiEnsemble, bracketProbability } from "./weather/KalshiEnsemble";
 import { HighConvictionLog } from "./output/HighConvictionLog";
 
@@ -31,8 +31,8 @@ async function main() {
   // 1. Kalshi demo reachability
   section("Kalshi demo: list events (no auth required)");
   try {
-    const client = new KalshiClient({ env: "demo" });
-    const page = await client.listEvents({ status: "open", limit: 5 });
+    const client = new KalshiClient({ demo: true });
+    const page = await client.getEvents({ status: "open", limit: 5 });
     const count = (page.events ?? []).length;
     console.log(`  ${count} events returned`);
     if (count > 0) {

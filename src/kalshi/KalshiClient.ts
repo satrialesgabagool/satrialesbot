@@ -15,15 +15,19 @@ import type {
   KalshiOrderBook,
   KalshiOrder,
   KalshiBalance,
+  KalshiTrade,
   CreateOrderRequest,
   GetEventsResponse,
   GetMarketsResponse,
   GetPositionsResponse,
+  GetTradesResponse,
   CreateOrderResponse,
 } from "./types";
 
 const PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2";
+const PROD_WS = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+const DEMO_WS = "wss://demo-api.kalshi.co/trade-api/ws/v2";
 
 export interface KalshiClientConfig {
   /** Use demo environment (default: true for safety) */
@@ -43,6 +47,11 @@ export class KalshiClient {
     this.baseUrl = config?.demo !== false ? DEMO_BASE : PROD_BASE;
     this.creds = config?.credentials ?? null;
     this.timeout = config?.timeout ?? 10_000;
+  }
+
+  /** WebSocket URL for trade/ticker/orderbook streaming (whale tracker). */
+  get wsUrl(): string {
+    return this.baseUrl === DEMO_BASE ? DEMO_WS : PROD_WS;
   }
 
   get isDemo(): boolean {
@@ -227,6 +236,47 @@ export class KalshiClient {
       undefined,
       true,
     );
+  }
+
+  // ─── Trades (for whale tracker) ──────────────────────────────────
+
+  /**
+   * List recent trades across one or all markets.
+   * Used by the whale tracker in REST-polling mode.
+   */
+  async listTrades(params?: {
+    ticker?: string;
+    limit?: number;
+    cursor?: string;
+    min_ts?: number;
+    max_ts?: number;
+  }): Promise<GetTradesResponse> {
+    const qs = new URLSearchParams();
+    if (params?.ticker) qs.set("ticker", params.ticker);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.cursor) qs.set("cursor", params.cursor);
+    if (params?.min_ts) qs.set("min_ts", String(params.min_ts));
+    if (params?.max_ts) qs.set("max_ts", String(params.max_ts));
+
+    const query = qs.toString();
+    return this.request<GetTradesResponse>("GET", `/markets/trades${query ? `?${query}` : ""}`);
+  }
+
+  /**
+   * Paginate through all trades matching filters.
+   */
+  async *paginateTrades(params?: {
+    ticker?: string;
+    limit?: number;
+    min_ts?: number;
+    max_ts?: number;
+  }): AsyncGenerator<KalshiTrade> {
+    let cursor: string | undefined;
+    do {
+      const res = await this.listTrades({ ...params, cursor });
+      for (const t of res.trades) yield t;
+      cursor = res.cursor || undefined;
+    } while (cursor);
   }
 
   // ─── Utility ──────────────────────────────────────────────────────

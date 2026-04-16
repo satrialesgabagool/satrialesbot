@@ -13,7 +13,7 @@
  * yourself, not racing someone else's order. We just detect and log.
  */
 
-import type { KalshiClient } from "../client/KalshiClient";
+import type { KalshiClient } from "../KalshiClient";
 import { HighConvictionLog, type HighConvictionRow } from "../output/HighConvictionLog";
 import { TradeFeed, type TradeFeedOptions } from "./TradeFeed";
 import { VolumeTracker, type VolumeTrackerConfig } from "./VolumeTracker";

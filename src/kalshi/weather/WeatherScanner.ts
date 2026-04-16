@@ -18,10 +18,10 @@
  * detector that writes opportunities to disk for you to review.
  */
 
-import type { KalshiClient } from "../client/KalshiClient";
+import { findKalshiWeatherMarkets } from "../KalshiWeatherFinder";
+import type { WeatherMarket, TempBracket } from "../../weather/WeatherMarketFinder";
 import { HighConvictionLog, type HighConvictionRow } from "../output/HighConvictionLog";
 import { bracketProbability, fetchKalshiEnsemble, type KalshiEnsembleDay } from "./KalshiEnsemble";
-import { WeatherMarketFinder, type WeatherEvent, type WeatherBracket } from "./MarketFinder";
 
 export interface WeatherScannerConfig {
   minEdgeBps: number;       // e.g. 500 → 5% edge required
@@ -42,18 +42,14 @@ export const DEFAULT_WEATHER_SCANNER_CONFIG: WeatherScannerConfig = {
 };
 
 export class WeatherScanner {
-  private readonly finder: WeatherMarketFinder;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private scanCount = 0;
 
   constructor(
-    private readonly client: KalshiClient,
     private readonly log: HighConvictionLog,
     private readonly config: WeatherScannerConfig = DEFAULT_WEATHER_SCANNER_CONFIG,
-  ) {
-    this.finder = new WeatherMarketFinder(client);
-  }
+  ) {}
 
   async start(): Promise<void> {
     console.log(`[weather] scanner started — cadence=${this.config.intervalMs / 1000}s`);
@@ -85,11 +81,11 @@ export class WeatherScanner {
   private async runOnce(): Promise<void> {
     this.scanCount++;
     const t0 = Date.now();
-    const events = await this.finder.findActive();
-    console.log(`[weather] scan #${this.scanCount}: ${events.length} active events`);
+    const markets = await findKalshiWeatherMarkets({ daysAhead: 3 });
+    console.log(`[weather] scan #${this.scanCount}: ${markets.length} active markets`);
 
-    // Group events by city so we only hit each weather API once per city per scan.
-    const cities = [...new Set(events.map((e) => e.city))];
+    // Group markets by city so we only hit each weather API once per city per scan.
+    const cities = [...new Set(markets.map((m) => m.city))];
     const ensembleByCity = new Map<string, Awaited<ReturnType<typeof fetchKalshiEnsemble>>>();
     await Promise.all(
       cities.map(async (city) => {
@@ -98,23 +94,23 @@ export class WeatherScanner {
     );
 
     let hits = 0;
-    for (const ev of events) {
-      const ensemble = ensembleByCity.get(ev.city);
+    for (const market of markets) {
+      const ensemble = ensembleByCity.get(market.city);
       if (!ensemble) continue;
 
-      const day = ensemble.days.find((d) => d.date === ev.resolveDate);
+      const day = ensemble.days.find((d) => d.date === market.date);
       if (!day) continue;
 
       if (day.sourceCount < this.config.minSources) continue;
       if (day.spreadHighF > this.config.maxSpreadF) continue;
 
-      const hoursLeft = (new Date(ev.closeTime).getTime() - Date.now()) / 3_600_000;
+      const hoursLeft = (new Date(market.endDate).getTime() - Date.now()) / 3_600_000;
       if (hoursLeft > this.config.maxHorizonHours || hoursLeft <= 0) continue;
 
-      for (const b of ev.brackets) {
+      for (const b of market.brackets) {
         if (b.liquidity < this.config.minLiquidity) continue;
 
-        const row = this.evaluateBracket(ev, b, day, hoursLeft);
+        const row = this.evaluateBracket(market, b, day, hoursLeft);
         if (row) {
           this.log.append(row);
           hits++;
@@ -127,16 +123,16 @@ export class WeatherScanner {
   }
 
   private evaluateBracket(
-    ev: WeatherEvent,
-    b: WeatherBracket,
+    market: WeatherMarket,
+    b: TempBracket,
     day: KalshiEnsembleDay,
     hoursLeft: number,
   ): HighConvictionRow | null {
-    const ensembleMean = ev.type === "high" ? day.ensembleHighF : day.ensembleLowF;
-    const spread = ev.type === "high" ? day.spreadHighF : day.spreadLowF;
+    const ensembleMean = market.type === "high" ? day.ensembleHighF : day.ensembleLowF;
+    const spread = market.type === "high" ? day.spreadHighF : day.spreadLowF;
 
     const trueProb = bracketProbability(ensembleMean, spread, b.lowF, b.highF, hoursLeft);
-    const marketProb = b.yesAsk / 100;
+    const marketProb = b.outcomePrices[0];
     const edge = trueProb - marketProb;
     const edgeBps = Math.round(edge * 10000);
 
@@ -149,18 +145,18 @@ export class WeatherScanner {
     return {
       timestamp: new Date().toISOString(),
       strategy: "weather",
-      eventTicker: ev.eventTicker,
-      marketTicker: b.marketTicker,
+      eventTicker: market.eventId,
+      marketTicker: b.slug,
       side: "yes",
-      yesPrice: b.yesAsk,
+      yesPrice: Math.round(b.outcomePrices[0] * 100),
       sizeContracts: 0, // scanner only — no sizing here
       conviction: Math.round(conviction * 10000) / 10000,
       edgeBps,
-      reason: formatReason(ev, b, day, trueProb, marketProb, hoursLeft),
+      reason: formatReason(market, b, day, trueProb, marketProb, hoursLeft),
       metadata: {
-        city: ev.city,
-        type: ev.type,
-        resolveDate: ev.resolveDate,
+        city: market.city,
+        type: market.type,
+        resolveDate: market.date,
         hoursLeft: Math.round(hoursLeft * 10) / 10,
         ensembleF: ensembleMean,
         spreadF: spread,
@@ -170,7 +166,7 @@ export class WeatherScanner {
         bracketHighF: isFinite(b.highF) ? b.highF : null,
         trueProb: Math.round(trueProb * 10000) / 10000,
         marketProb: Math.round(marketProb * 10000) / 10000,
-        volume24h: b.volume24h,
+        volume24h: b.volume,
         liquidity: b.liquidity,
       },
     };
@@ -178,8 +174,8 @@ export class WeatherScanner {
 }
 
 function formatReason(
-  ev: WeatherEvent,
-  b: WeatherBracket,
+  market: WeatherMarket,
+  b: TempBracket,
   day: KalshiEnsembleDay,
   trueProb: number,
   marketProb: number,
@@ -188,7 +184,7 @@ function formatReason(
   const lo = isFinite(b.lowF) ? `${b.lowF}` : "-∞";
   const hi = isFinite(b.highF) ? `${b.highF}` : "+∞";
   return (
-    `${ev.city} ${ev.type} ${ev.resolveDate} [${lo},${hi}°F]: ` +
+    `${market.city} ${market.type} ${market.date} [${lo},${hi}°F]: ` +
     `ensemble=${day.ensembleHighF.toFixed(1)}°F±${day.spreadHighF.toFixed(1)} ` +
     `(${day.sourceCount} sources, agree=${day.agreement.toFixed(2)}), ` +
     `model_p=${(trueProb * 100).toFixed(1)}% vs market=${(marketProb * 100).toFixed(1)}%, ` +
