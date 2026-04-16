@@ -16,13 +16,29 @@
 
 import { fetchWithRetry } from "../net/fetchWithRetry";
 
-// City coordinates
+// City coordinates — covers both Polymarket (international) and Kalshi (US) cities
 const CITY_COORDS: Record<string, { lat: number; lon: number; country: "US" | "INT" }> = {
+  // US cities (Kalshi + Polymarket)
   "new york city": { lat: 40.7128, lon: -74.0060, country: "US" },
   "nyc": { lat: 40.7128, lon: -74.0060, country: "US" },
+  "chicago": { lat: 41.8781, lon: -87.6298, country: "US" },
+  "miami": { lat: 25.7617, lon: -80.1918, country: "US" },
+  "los angeles": { lat: 34.0522, lon: -118.2437, country: "US" },
+  "austin": { lat: 30.2672, lon: -97.7431, country: "US" },
+  "denver": { lat: 39.7392, lon: -104.9903, country: "US" },
   "atlanta": { lat: 33.7490, lon: -84.3880, country: "US" },
   "dallas": { lat: 32.7767, lon: -96.7970, country: "US" },
   "seattle": { lat: 47.6062, lon: -122.3321, country: "US" },
+  "houston": { lat: 29.7604, lon: -95.3698, country: "US" },
+  "phoenix": { lat: 33.4484, lon: -112.0740, country: "US" },
+  "boston": { lat: 42.3601, lon: -71.0589, country: "US" },
+  "las vegas": { lat: 36.1699, lon: -115.1398, country: "US" },
+  "minneapolis": { lat: 44.9778, lon: -93.2650, country: "US" },
+  "philadelphia": { lat: 39.9526, lon: -75.1652, country: "US" },
+  "san francisco": { lat: 37.7749, lon: -122.4194, country: "US" },
+  "san antonio": { lat: 29.4241, lon: -98.4936, country: "US" },
+  "washington dc": { lat: 38.9072, lon: -77.0369, country: "US" },
+  // International cities (Polymarket)
   "london": { lat: 51.5074, lon: -0.1278, country: "INT" },
   "paris": { lat: 48.8566, lon: 2.3522, country: "INT" },
   "tokyo": { lat: 35.6762, lon: 139.6503, country: "INT" },
