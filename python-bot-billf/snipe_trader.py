@@ -93,6 +93,21 @@ class SnipeConfig:
     min_bet: float = 1.0
     fee_rate: float = 0.072
 
+    # --- Kelly sizing (confidence-based risk) ----------------------------
+    # When enabled, bet size scales with the edge between our empirical
+    # win rate for the bucket and the current market price, using a
+    # fractional Kelly. This beats flat conviction sizing on the growth
+    # curve because it (a) naturally bets more when the price offers more
+    # edge and (b) concentrates capital on the buckets with the strongest
+    # historical track record.
+    use_kelly: bool = True
+    kelly_fraction: float = 0.50          # 0.5 = half-Kelly (growth/variance balance)
+    kelly_min_samples: int = 5            # below this bucket sample count, fall back
+    kelly_prior_alpha: float = 2.0        # Beta(a,b) prior — pulls small N toward 0.5
+    kelly_prior_beta: float = 2.0
+    kelly_min_p: float = 0.55             # need at least this much edge over 50/50
+    kelly_max_p: float = 0.98             # ceiling on the smoothed win probability
+
     # --- Resolution deadline (s after window close) ---
     resolution_deadline_s: int = 900  # 15 min
 
@@ -161,6 +176,248 @@ class SnipeHunter:
             c: {"trades": 0, "wins": 0, "pnl": 0.0}
             for c in ("weak", "medium", "strong")
         }
+        # Joint bucket: (stage, conviction) → {trades, wins, pnl}. This is
+        # what Kelly sizing queries for its probability estimate.
+        self.bucket_stats: Dict[Tuple[str, str], Dict[str, float]] = {
+            (s, c): {"trades": 0, "wins": 0, "pnl": 0.0}
+            for s in ("pre_close", "at_close", "post_close")
+            for c in ("weak", "medium", "strong")
+        }
+
+        # Replay DB state AFTER all counters/stats dicts are initialized.
+        # This makes the hunter restart-safe: bankroll & counters resume
+        # from where prior sessions left off.
+        try:
+            self._load_persisted_state()
+        except Exception as e:
+            log.warning(f"Could not load persisted state (fresh start): {e}")
+
+    # --------------------------------------------------------
+    # Persistence — load all-time state from snipe.db so that
+    # relaunching the hunter resumes from the correct bankroll
+    # and win/loss counters, instead of starting over at $20.
+    # --------------------------------------------------------
+
+    def _load_persisted_state(self):
+        """
+        Replay all resolved v3 trades from the DB into in-memory state.
+        Also populates `bucket_stats[(stage, conviction)]` so Kelly sizing
+        has accurate sample counts from day one of a restart.
+
+        The conviction label is inferred from model_name when possible
+        (format: 'snipe_<stage>_<conviction>'). Older rows without it
+        fall back to 'weak' which is the neutral/safe default.
+        """
+        import sqlite3
+        conn = sqlite3.connect(self.db_path, timeout=5)
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT window_id, model_name, side, pnl
+                FROM live_trades
+                WHERE outcome IS NOT NULL
+                  AND window_id LIKE 'snipe-v3-%'
+                ORDER BY COALESCE(resolved_at, timestamp) ASC
+            """)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return
+
+        for window_id, model_name, side, pnl in rows:
+            pnl = float(pnl or 0.0)
+            self.bankroll += pnl
+            self.total_pnl += pnl
+            self.total_snipes += 1
+            if pnl > 0:
+                self.total_wins += 1
+
+            stage = self._parse_stage(window_id)
+            conviction = self._parse_conviction(model_name)
+
+            if stage and stage in self.stage_stats:
+                st = self.stage_stats[stage]
+                st["trades"] += 1
+                if pnl > 0:
+                    st["wins"] += 1
+                st["pnl"] += pnl
+
+            if conviction and conviction in self.conviction_stats:
+                cv = self.conviction_stats[conviction]
+                cv["trades"] += 1
+                if pnl > 0:
+                    cv["wins"] += 1
+                cv["pnl"] += pnl
+
+            if stage and conviction and (stage, conviction) in self.bucket_stats:
+                bk = self.bucket_stats[(stage, conviction)]
+                bk["trades"] += 1
+                if pnl > 0:
+                    bk["wins"] += 1
+                bk["pnl"] += pnl
+
+            self.peak_bankroll = max(self.peak_bankroll, self.bankroll)
+
+        log.info(
+            f"Loaded persisted state: bankroll=${self.bankroll:.2f}, "
+            f"peak=${self.peak_bankroll:.2f}, "
+            f"{self.total_wins}W/{self.total_snipes - self.total_wins}L, "
+            f"pnl=${self.total_pnl:+.2f}"
+        )
+
+    # --------------------------------------------------------
+    # Bucket helpers — parse stage/conviction from DB rows
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _parse_stage(window_id: str) -> Optional[str]:
+        if not window_id or not window_id.startswith("snipe-v3-"):
+            return None
+        rest = window_id[len("snipe-v3-"):]
+        for s in ("pre_close", "at_close", "post_close"):
+            if rest.startswith(s + "-"):
+                return s
+        return None
+
+    @staticmethod
+    def _parse_conviction(model_name: Optional[str]) -> Optional[str]:
+        # model_name format: 'snipe_<stage>_<conviction>'
+        # stage has an underscore (pre_close, at_close, post_close)
+        if not model_name:
+            return None
+        parts = model_name.split("_")
+        # ['snipe', 'pre', 'close', 'weak'] → conviction = parts[3]
+        if len(parts) >= 4 and parts[0] == "snipe":
+            c = parts[3]
+            if c in ("weak", "medium", "strong"):
+                return c
+        return None
+
+    # --------------------------------------------------------
+    # Kelly sizing — uses empirical bucket win rate (smoothed)
+    # combined with current market price to derive optimal bet.
+    # --------------------------------------------------------
+
+    def _bucket_probability(
+        self, stage: str, conviction: str
+    ) -> Tuple[float, int]:
+        """
+        Return (smoothed_win_prob, n_samples) for a (stage, conviction)
+        bucket. Uses Beta(alpha, beta) smoothing so fresh buckets default
+        toward 0.5 instead of overfitting tiny samples.
+
+        Hierarchical fallback: if the specific bucket has fewer than
+        kelly_min_samples, combine with a parent bucket (same stage,
+        any conviction) to get a more reliable estimate.
+        """
+        cfg = self.config
+        a0, b0 = cfg.kelly_prior_alpha, cfg.kelly_prior_beta
+
+        bk = self.bucket_stats.get((stage, conviction), {"trades": 0, "wins": 0})
+        n = int(bk["trades"])
+        w = int(bk["wins"])
+
+        # If bucket is sparse, pool with sibling buckets in the same stage.
+        if n < cfg.kelly_min_samples:
+            parent = self.stage_stats.get(stage, {"trades": 0, "wins": 0})
+            n_parent = int(parent["trades"])
+            w_parent = int(parent["wins"])
+            # Combine: own observations count fully, parent contributes
+            # proportionally (half weight, so specific bucket still has
+            # more pull when it has a few samples).
+            n_eff = n + 0.5 * n_parent
+            w_eff = w + 0.5 * w_parent
+            p = (w_eff + a0) / (n_eff + a0 + b0)
+            return (min(max(p, 0.0), cfg.kelly_max_p), n)
+
+        # Enough samples — use bucket directly with prior smoothing.
+        p = (w + a0) / (n + a0 + b0)
+        return (min(max(p, 0.0), cfg.kelly_max_p), n)
+
+    def _kelly_fraction(self, p: float, q: float) -> float:
+        """
+        Classical binary-bet Kelly: f* = (p - q) / (1 - q).
+
+        We're buying a $1 contract at price q, so on win we gain (1-q)/q
+        per dollar, on loss we lose 1. Kelly-optimal fraction is the
+        above. Returns 0 if no edge or edge is negative.
+        """
+        if q <= 0 or q >= 1.0:
+            return 0.0
+        if p <= q:
+            return 0.0
+        return (p - q) / (1.0 - q)
+
+    def _compute_bet_size(
+        self,
+        stage: str,
+        conviction: str,
+        winner_price: float,
+        move_pct: float,
+    ) -> Tuple[float, str, dict]:
+        """
+        Decide how much to bet.
+
+        Returns (dollars, mode, info). mode is one of:
+          - 'kelly'      : Kelly formula with empirical p (preferred)
+          - 'conviction' : fall-back flat/pct sizing when Kelly disabled,
+                           bucket too sparse, or no positive edge
+        info contains diagnostic fields that are stored on the pending
+        trade and surfaced in logs/GUI so we can see why each bet sized
+        the way it did.
+        """
+        cfg = self.config
+
+        # ---- Old conviction-based size (always computed as fallback) ----
+        if conviction == "strong":
+            conv_size = self.bankroll * cfg.size_strong_pct
+        elif conviction == "medium":
+            conv_size = self.bankroll * cfg.size_medium_pct
+        else:
+            conv_size = cfg.size_weak_flat
+
+        cap = self.bankroll * cfg.size_cap_pct
+
+        if not cfg.use_kelly:
+            size = max(min(conv_size, cap, self.bankroll - 0.01), cfg.min_bet)
+            return (size, "conviction", {
+                "p": None, "q": winner_price, "kelly_f": None,
+                "n": None, "fraction": None,
+            })
+
+        p, n = self._bucket_probability(stage, conviction)
+        q = winner_price
+        kelly_f = self._kelly_fraction(p, q)
+
+        info = {
+            "p": round(p, 4),
+            "q": round(q, 4),
+            "kelly_f": round(kelly_f, 4),
+            "n": n,
+            "fraction": cfg.kelly_fraction,
+        }
+
+        # Fallbacks to conviction sizing
+        if p < cfg.kelly_min_p or kelly_f <= 0.0 or n == 0:
+            size = max(min(conv_size, cap, self.bankroll - 0.01), cfg.min_bet)
+            return (size, "conviction", info)
+
+        # Fractional Kelly
+        kelly_pct = cfg.kelly_fraction * kelly_f
+        kelly_size = kelly_pct * self.bankroll
+
+        # Blend: take the MAX of Kelly and conviction (don't under-bet
+        # strong signals just because a bucket is small). Then cap hard.
+        size = max(kelly_size, conv_size)
+        size = min(size, cap, self.bankroll - 0.01)
+        size = max(size, cfg.min_bet)
+
+        info["kelly_pct"] = round(kelly_pct, 4)
+        info["conv_size"] = round(conv_size, 2)
+        info["final_size"] = round(size, 2)
+        return (size, "kelly", info)
 
     # --------------------------------------------------------
     # Spot price at a specific epoch (for move calculation)
@@ -299,20 +556,20 @@ class SnipeHunter:
         if winner_price > gate or winner_price < cfg.gate_min:
             return
 
-        # 5. Conviction + sizing
+        # 5. Conviction label from spot-move magnitude
         if abs_move >= cfg.move_strong:
             conviction = "strong"
-            size = self.bankroll * cfg.size_strong_pct
         elif abs_move >= cfg.move_medium:
             conviction = "medium"
-            size = self.bankroll * cfg.size_medium_pct
         else:
             conviction = "weak"
-            size = cfg.size_weak_flat
 
-        # Enforce min and cap
-        size = max(size, cfg.min_bet)
-        size = min(size, self.bankroll * cfg.size_cap_pct, self.bankroll - 0.01)
+        # 5a. Risk-adjusted sizing: Kelly on empirical bucket win rate,
+        #     with a conviction-based floor. Pure conviction sizing when
+        #     the bucket is too thin or Kelly shows no edge.
+        size, sizing_mode, sizing_info = self._compute_bet_size(
+            stage, conviction, winner_price, move_pct
+        )
         if size < cfg.min_bet:
             return
 
@@ -354,15 +611,26 @@ class SnipeHunter:
         market_key = f"{asset}-{tf}"
         self.market_stats.setdefault(market_key, {"trades": 0, "wins": 0, "pnl": 0.0})
 
+        # Build a sizing descriptor for logs + events. When Kelly fires, show
+        # p/q/kelly_f alongside the dollar amount so the decision is auditable.
+        if sizing_mode == "kelly" and sizing_info.get("kelly_f") is not None:
+            sizing_tag = (
+                f"kelly p={sizing_info['p']:.2f} q={sizing_info['q']:.2f} "
+                f"f={sizing_info['kelly_f']:.2f} n={sizing_info['n']}"
+            )
+        else:
+            sizing_tag = f"conviction {conviction}"
+
         log.info(
             f"  [{stage.upper()} {market_key}] BOUGHT {direction} @ {winner_price:.3f} | "
-            f"${cost_dollars:.2f} ({conviction}, spot {move_pct*100:+.2f}%) | "
+            f"${cost_dollars:.2f} ({sizing_tag}, spot {move_pct*100:+.2f}%) | "
             f"bank(committed)=${self.bankroll:.2f}"
         )
         self._push_event({
             "ts": time.time(), "kind": "FIRE", "stage": stage, "market": market_key,
             "side": side, "direction": direction, "price": winner_price,
             "size": cost_dollars, "conviction": conviction, "move_pct": move_pct,
+            "sizing_mode": sizing_mode, "sizing_info": sizing_info,
             "pnl": 0.0, "bankroll": self.bankroll,
         })
 
@@ -458,6 +726,14 @@ class SnipeHunter:
             if won:
                 cstat["wins"] += 1
             cstat["pnl"] += pnl
+
+        # Joint (stage, conviction) bucket — this is what Kelly sizing reads.
+        bstat = self.bucket_stats.get((stage, conviction))
+        if bstat is not None:
+            bstat["trades"] += 1
+            if won:
+                bstat["wins"] += 1
+            bstat["pnl"] += pnl
 
         market_key = f"{p.asset}-{p.timeframe}"
         mstat = self.market_stats.setdefault(

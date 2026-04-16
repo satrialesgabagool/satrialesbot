@@ -250,27 +250,32 @@ class SnipeGUI:
                                       font=("Segoe UI Semibold", 10))
         self.status_label.grid(row=0, column=7, sticky="e")
 
-        # Metric row — 6 big cells
-        def _mk_metric(col: int, title: str):
+        # Metric row — 6 big cells + optional small subtitle line
+        def _mk_metric(col: int, title: str, with_sub: bool = False):
             lbl_t = ttk.Label(header, text=title, style="CardH.TLabel",
                               font=("Segoe UI", 9))
             lbl_t.grid(row=1, column=col, sticky="w", pady=(10, 0))
-            lbl_v = ttk.Label(header, text="—", style="Big.TLabel")
+            lbl_v = ttk.Label(header, text="--", style="Big.TLabel")
             lbl_v.grid(row=2, column=col, sticky="w", pady=(0, 0))
-            return lbl_v
+            sub = None
+            if with_sub:
+                sub = ttk.Label(header, text="", style="CardH.TLabel",
+                                font=("Segoe UI", 8))
+                sub.grid(row=3, column=col, sticky="w", pady=(0, 0))
+            return lbl_v, sub
 
-        self.m_bankroll = _mk_metric(0, "BANKROLL")
-        self.m_pnl = _mk_metric(1, "TOTAL P&L")
-        self.m_roi = _mk_metric(2, "ROI")
-        self.m_wr = _mk_metric(3, "WIN RATE")
-        self.m_peak = _mk_metric(4, "PEAK")
-        self.m_dd = _mk_metric(5, "DRAWDOWN")
-        self.m_trades = _mk_metric(6, "SNIPES")
-        self.m_uptime = _mk_metric(7, "UPTIME")
+        self.m_bankroll, self.m_bankroll_sub = _mk_metric(0, "EQUITY", with_sub=True)
+        self.m_pnl, _ = _mk_metric(1, "TOTAL P&L")
+        self.m_roi, _ = _mk_metric(2, "ROI")
+        self.m_wr, _ = _mk_metric(3, "WIN RATE")
+        self.m_peak, _ = _mk_metric(4, "PEAK")
+        self.m_dd, _ = _mk_metric(5, "DRAWDOWN")
+        self.m_trades, _ = _mk_metric(6, "SNIPES")
+        self.m_uptime, _ = _mk_metric(7, "UPTIME")
 
-        # Button row
+        # Button row (below subtitles)
         btn_frame = ttk.Frame(header, style="Card.TFrame")
-        btn_frame.grid(row=3, column=0, columnspan=8, sticky="e", pady=(10, 0))
+        btn_frame.grid(row=4, column=0, columnspan=8, sticky="e", pady=(10, 0))
         self.pause_btn = ttk.Button(btn_frame, text="Pause new snipes",
                                     command=self._toggle_pause)
         self.pause_btn.pack(side="right", padx=(8, 0))
@@ -459,28 +464,74 @@ class SnipeGUI:
             self.root.after(self.REFRESH_MS, self._refresh)
 
     def _refresh_header(self):
+        """
+        Header metrics are SOURCED FROM THE DATABASE (all-time), not just this
+        hunter instance's in-memory counters. This prevents the display from
+        "resetting" when the GUI is relaunched: a fresh SnipeHunter starts
+        with bankroll=$20 and zero trades, but the DB remembers the full
+        history across all sessions.
+
+        What each metric now means:
+          BANKROLL  = initial_bankroll + sum(resolved pnl) - committed-to-pending
+                      (i.e. free cash on hand right now)
+          TOTAL P&L = sum of all resolved pnl from the DB
+          ROI       = TOTAL P&L / initial_bankroll
+          WIN RATE  = DB wins / DB trades (by pnl sign, not outcome column)
+          PEAK      = running max of cumulative bankroll curve
+          DRAWDOWN  = (peak - equity) / peak, where equity = free + committed
+          SNIPES    = DB (W/L) count
+          UPTIME    = this GUI session uptime
+        """
         h = self.hunter
         t = THEME
 
-        bank = h.bankroll
-        peak = h.peak_bankroll
-        pnl = h.total_pnl
-        roi = (pnl / self.config.initial_bankroll * 100) if self.config.initial_bankroll else 0
-        wr = (h.total_wins / h.total_snipes * 100) if h.total_snipes else None
-        dd = ((peak - bank) / peak * 100) if peak else 0
+        stats = self._query_alltime_stats()
+        wins = stats["wins"]
+        losses = stats["losses"]
+        trades = wins + losses
+        total_pnl = stats["pnl"]
+
+        # Free cash = what the hunter has NOT committed to pending trades.
+        # Committed = what's locked in open positions. Equity = free + committed.
+        committed = sum(p.shares * p.total_cost for p in self.hunter.pending)
+        free_cash = h.bankroll  # hunter's in-memory = free cash by construction
+        equity = free_cash + committed  # total portfolio value
+
+        # Peak / drawdown over the TRUE equity curve, not just free cash
+        curve = self._build_equity_curve()
+        peak = max((y for _, y in curve), default=self.config.initial_bankroll)
+        peak = max(peak, equity)
+        dd = ((peak - equity) / peak * 100) if peak else 0
+
+        wr = (wins / trades * 100) if trades else None
+        roi = (total_pnl / self.config.initial_bankroll * 100) if self.config.initial_bankroll else 0
         uptime = _format_duration(time.time() - self.start_time)
 
-        self.m_bankroll.config(text=_format_money(bank))
-        self.m_bankroll.config(style="BigGreen.TLabel" if bank >= self.config.initial_bankroll
-                                     else "BigRed.TLabel")
+        # Bankroll cell shows equity (everything you own). Subtitle shows the
+        # free/committed split so locked capital reads as locked, not lost.
+        self.m_bankroll.config(text=_format_money(equity))
+        # Color on actual profit state, not "below initial" (which trips the
+        # moment you commit $1 to a pending trade)
+        if total_pnl > 0:
+            self.m_bankroll.config(style="BigGreen.TLabel")
+        elif total_pnl < 0:
+            self.m_bankroll.config(style="BigRed.TLabel")
+        else:
+            self.m_bankroll.config(style="Big.TLabel")
 
-        self.m_pnl.config(text=_format_money(pnl, signed=True))
-        self.m_pnl.config(style="BigGreen.TLabel" if pnl >= 0 else "BigRed.TLabel")
+        # Subtitle: free + committed breakdown
+        if hasattr(self, "m_bankroll_sub"):
+            self.m_bankroll_sub.config(
+                text=f"free ${free_cash:,.2f} + locked ${committed:,.2f}"
+            )
+
+        self.m_pnl.config(text=_format_money(total_pnl, signed=True))
+        self.m_pnl.config(style="BigGreen.TLabel" if total_pnl >= 0 else "BigRed.TLabel")
 
         self.m_roi.config(text=_format_pct(roi, signed=True))
         self.m_roi.config(style="BigGreen.TLabel" if roi >= 0 else "BigRed.TLabel")
 
-        self.m_wr.config(text=f"{wr:.1f}%" if wr is not None else "—")
+        self.m_wr.config(text=f"{wr:.1f}%" if wr is not None else "--")
         self.m_wr.config(style="BigGreen.TLabel" if (wr or 0) >= 55 else
                               ("BigRed.TLabel" if (wr or 100) < 45 else "Big.TLabel"))
 
@@ -488,8 +539,59 @@ class SnipeGUI:
         self.m_dd.config(text=_format_pct(dd))
         self.m_dd.config(style="BigRed.TLabel" if dd > 15 else "Big.TLabel")
 
-        self.m_trades.config(text=f"{h.total_snipes} ({h.total_wins}W/{h.total_snipes - h.total_wins}L)")
+        self.m_trades.config(text=f"{trades} ({wins}W/{losses}L)")
         self.m_uptime.config(text=uptime)
+
+    def _query_alltime_stats(self) -> Dict[str, float]:
+        """
+        Read W/L/PnL over ALL resolved trades in snipe.db. Win/loss is
+        determined by pnl sign, not the `outcome` column (which encodes
+        YES-won/NO-won, independent of which side we bought).
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(pnl), 0.0)
+                FROM live_trades
+                WHERE outcome IS NOT NULL
+            """)
+            w, l, p = cur.fetchone()
+            conn.close()
+            return {"wins": int(w), "losses": int(l), "pnl": float(p)}
+        except Exception:
+            return {"wins": 0, "losses": 0, "pnl": 0.0}
+
+    def _build_equity_curve(self) -> List[tuple]:
+        """
+        Build a (timestamp, equity) series by summing PnL in chronological
+        order, starting from initial_bankroll. This is ROBUST to hunter
+        restarts because it ignores the (session-local) bankroll_after
+        column and only uses `pnl`, which is always correct.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COALESCE(resolved_at, timestamp), pnl
+                FROM live_trades
+                WHERE outcome IS NOT NULL
+                ORDER BY COALESCE(resolved_at, timestamp) ASC
+            """)
+            rows = cur.fetchall()
+            conn.close()
+        except Exception:
+            return []
+
+        equity = self.config.initial_bankroll
+        out: List[tuple] = [(rows[0][0] if rows else time.time(), equity)]
+        for ts, pnl in rows:
+            equity += float(pnl or 0.0)
+            out.append((ts, equity))
+        return out
 
     def _refresh_markets(self):
         tv = self.markets_tv
@@ -590,31 +692,39 @@ class SnipeGUI:
             ), tags=tags)
 
     def _refresh_bankroll_chart(self):
+        """
+        Plot a CUMULATIVE-PnL equity curve from the DB.
+
+        We deliberately do NOT use the bankroll_after column, because that
+        column records whatever the hunter THOUGHT its free cash was at
+        each trade — and a new hunter instance resets to initial_bankroll,
+        causing a phantom "crash" in the series. Summing pnl values in
+        chronological order from $20 is restart-safe and reflects reality.
+        """
         ax = self.bankroll_ax
         ax.clear()
         self._style_axes(ax)
 
-        # Pull (timestamp, bankroll_after) for resolved trades + pre-insert
-        rows = self._query_bankroll_series()
-        if rows:
-            xs_times, ys = zip(*rows)
-            xs = [(t - self.start_time) / 60.0 for t in xs_times]  # minutes since start
-            # Prepend origin point so the line starts at initial bankroll at t=0
-            xs = [0] + list(xs)
-            ys = [self.config.initial_bankroll] + list(ys)
+        curve = self._build_equity_curve()
+        if len(curve) >= 2:
+            xs_times, ys = zip(*curve)
+            # Anchor x at the first trade time so the curve fills the plot
+            t0 = xs_times[0]
+            xs = [(t - t0) / 60.0 for t in xs_times]
+            init = self.config.initial_bankroll
             ax.plot(xs, ys, color=THEME["green"], linewidth=2.0)
-            ax.fill_between(xs, self.config.initial_bankroll, ys,
-                            where=[y >= self.config.initial_bankroll for y in ys],
+            ax.fill_between(xs, init, ys,
+                            where=[y >= init for y in ys],
                             color=THEME["green"], alpha=0.15)
-            ax.fill_between(xs, self.config.initial_bankroll, ys,
-                            where=[y < self.config.initial_bankroll for y in ys],
+            ax.fill_between(xs, init, ys,
+                            where=[y < init for y in ys],
                             color=THEME["red"], alpha=0.15)
-            ax.axhline(self.config.initial_bankroll, color=THEME["fg_mute"],
+            ax.axhline(init, color=THEME["fg_mute"],
                        linestyle="--", linewidth=0.8, alpha=0.5)
-            ax.set_xlabel("Minutes since start")
-            ax.set_ylabel("Bankroll $")
+            ax.set_xlabel("Minutes since first trade")
+            ax.set_ylabel("Equity $")
         else:
-            ax.text(0.5, 0.5, "Waiting for first resolved trade…",
+            ax.text(0.5, 0.5, "Waiting for first resolved trade...",
                     ha="center", va="center", color=THEME["fg_mute"],
                     transform=ax.transAxes, fontsize=11)
             ax.set_xticks([])
@@ -722,6 +832,14 @@ class SnipeGUI:
             d = self.hunter.conviction_stats.get(c, {"trades": 0, "wins": 0, "pnl": 0.0})
             self._insert_stat_row(tv, "Conviction", c, d)
 
+        # (stage x conviction) buckets — this is what Kelly sizing uses.
+        # Shows the empirical edge per bucket, so the user can see what
+        # the bot is learning and whether Kelly will scale bets up there.
+        for (s, c), d in sorted(getattr(self.hunter, "bucket_stats", {}).items()):
+            if int(d.get("trades", 0) or 0) == 0:
+                continue  # hide empty buckets to reduce clutter
+            self._insert_stat_row(tv, "Bucket", f"{s}/{c}", d)
+
         # Market
         for k in sorted(self.hunter.market_stats.keys()):
             d = self.hunter.market_stats[k]
@@ -755,9 +873,17 @@ class SnipeGUI:
             if ev["kind"] == "FIRE":
                 move_s = (f"spot {ev['move_pct']*100:+.2f}%"
                           if ev.get("move_pct") is not None else "")
+                # Show sizing mode — kelly with p/f/n, or conviction label.
+                mode = ev.get("sizing_mode") or "conviction"
+                info = ev.get("sizing_info") or {}
+                if mode == "kelly" and info.get("p") is not None:
+                    size_tag = (f"kelly p={info['p']:.2f} f={info['kelly_f']:.2f} "
+                                f"n={info['n']}")
+                else:
+                    size_tag = f"{ev['conviction']}"
                 line = (f"[{ts}] FIRE  {ev['market']:<8} {ev['stage']:<10} "
                         f"{ev['side']:<3} @{ev['price']:.3f} ${ev['size']:.2f} "
-                        f"({ev['conviction']}, {move_s})\n")
+                        f"({size_tag}, {move_s})\n")
                 tag = "fire"
             elif ev["kind"] == "WIN":
                 line = (f"[{ts}] WIN   {ev['market']:<8} {ev['stage']:<10} "

@@ -23,6 +23,30 @@ export type MarketFinderFn = (options?: {
   daysAhead?: number;
 }) => Promise<WeatherMarket[]>;
 
+/**
+ * Optional real-order executor. When provided, the simulator delegates
+ * the actual fill to this hook instead of just decrementing the paper
+ * balance. Returning null / throwing causes the leg to be skipped (no
+ * balance change, no position opened).
+ *
+ * IMPORTANT: The simulator does NOT automatically turn this on. The
+ * weather strategy's 2026-04-15 backtest showed negative edge
+ * (23.7% WR, -0.8% ROI on $500). Wiring a real executor here is only
+ * useful as a reusable shape for the BTC/other markets where the snipe
+ * bot has demonstrated edge. Paper mode remains the default and is
+ * what all of the existing runners use.
+ */
+export interface OrderExecutor {
+  /** Return the actual filled share count + cost, or null on miss. */
+  placeLimitBuy(opts: {
+    marketId: string;
+    bracketLabel: string;
+    side: "yes" | "no";
+    shares: number;
+    limitPrice: number;
+  }): Promise<{ fillShares: number; fillCost: number; orderId: string } | null>;
+}
+
 // City coordinates for archive API lookups
 const CITY_COORDS: Record<string, [number, number]> = {
   "new york city": [40.7128, -74.0060],
@@ -82,6 +106,13 @@ export interface SimulatorConfig {
   marketFinder?: MarketFinderFn;
   /** Exchange label for display/logging */
   exchange?: "polymarket" | "kalshi";
+  /**
+   * Optional real-order executor. When provided, BUYs flow through it
+   * instead of just decrementing the paper balance. See OrderExecutor
+   * docs above — weather strategy has no verified edge, so paper is
+   * still the recommended default.
+   */
+  orderExecutor?: OrderExecutor;
 }
 
 export interface SimulatorState {
@@ -532,11 +563,37 @@ export class WeatherSimulator {
 
       for (const { bracket, prob, edge, allocation } of allocations) {
         const entryPrice = bracket.outcomePrices[0];
-        const shares = Math.floor(allocation / entryPrice);
+        let shares = Math.floor(allocation / entryPrice);
         if (shares < 1) continue;
 
-        const cost = shares * entryPrice;
+        let cost = shares * entryPrice;
         if (cost > this.state.balance - this.state.deployed) continue;
+
+        // Optional: route through a real-order executor if provided.
+        // Paper mode (default) just subtracts balance and records the
+        // paper fill. The executor is an explicit opt-in because the
+        // weather strategy has no verified edge (backtest 23.7% WR,
+        // -0.8% ROI on 2026-04-15).
+        if (this.config.orderExecutor) {
+          try {
+            const fill = await this.config.orderExecutor.placeLimitBuy({
+              marketId: `${market.city}-${market.date}-${market.type}`,
+              bracketLabel: this.bracketLabel(bracket),
+              side: "yes",
+              shares,
+              limitPrice: entryPrice,
+            });
+            if (!fill || fill.fillShares < 1) {
+              this.log(`  LEG ${this.bracketLabel(bracket)} — LIVE order unfilled, skipping`, "yellow");
+              continue;
+            }
+            shares = fill.fillShares;
+            cost = fill.fillCost;
+          } catch (err) {
+            this.log(`  LEG ${this.bracketLabel(bracket)} — LIVE order error: ${err}`, "red");
+            continue;
+          }
+        }
 
         const pos: WeatherPosition = {
           id: `WP-${++this.positionCounter}`,
@@ -568,8 +625,9 @@ export class WeatherSimulator {
         opportunitiesFound++;
 
         const payoff = (shares * 1.0 / cost).toFixed(0);
+        const execTag = this.config.orderExecutor ? " [LIVE]" : "";
         this.log(
-          `  LEG ${this.bracketLabel(bracket)} ` +
+          `  LEG ${this.bracketLabel(bracket)}${execTag} ` +
           `${shares}sh @ $${entryPrice.toFixed(2)} ($${cost.toFixed(2)}) ` +
           `prob=${(prob * 100).toFixed(0)}% edge=+${(edge * 100).toFixed(0)}% ` +
           `payoff=${payoff}:1`,
