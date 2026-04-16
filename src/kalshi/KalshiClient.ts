@@ -15,10 +15,12 @@ import type {
   KalshiOrderBook,
   KalshiOrder,
   KalshiBalance,
+  KalshiTrade,
   CreateOrderRequest,
   GetEventsResponse,
   GetMarketsResponse,
   GetPositionsResponse,
+  GetTradesResponse,
   CreateOrderResponse,
 } from "./types";
 
@@ -110,6 +112,8 @@ export class KalshiClient {
     series_ticker?: string;
     status?: "unopened" | "open" | "closed" | "settled";
     with_nested_markets?: boolean;
+    min_close_ts?: number;      // seconds since epoch — only events closing >= this
+    max_close_ts?: number;      // seconds since epoch — only events closing <= this
     limit?: number;
     cursor?: string;
   }): Promise<GetEventsResponse> {
@@ -117,6 +121,8 @@ export class KalshiClient {
     if (params?.series_ticker) qs.set("series_ticker", params.series_ticker);
     if (params?.status) qs.set("status", params.status);
     if (params?.with_nested_markets) qs.set("with_nested_markets", "true");
+    if (params?.min_close_ts != null) qs.set("min_close_ts", String(params.min_close_ts));
+    if (params?.max_close_ts != null) qs.set("max_close_ts", String(params.max_close_ts));
     if (params?.limit) qs.set("limit", String(params.limit));
     if (params?.cursor) qs.set("cursor", params.cursor);
 
@@ -131,6 +137,8 @@ export class KalshiClient {
     series_ticker?: string;
     status?: "unopened" | "open" | "closed" | "settled";
     with_nested_markets?: boolean;
+    min_close_ts?: number;
+    max_close_ts?: number;
   }): Promise<KalshiEvent[]> {
     const all: KalshiEvent[] = [];
     let cursor: string | undefined;
@@ -146,6 +154,79 @@ export class KalshiClient {
     } while (cursor);
 
     return all;
+  }
+
+  /**
+   * Get public trade tape for a specific market. No auth required.
+   * Paginates up to `maxPages` cursor pages.
+   */
+  async getTrades(params: {
+    ticker: string;
+    min_ts?: number;           // seconds
+    max_ts?: number;           // seconds
+    limit?: number;            // per page, max 1000
+    cursor?: string;
+  }): Promise<GetTradesResponse> {
+    const qs = new URLSearchParams();
+    qs.set("ticker", params.ticker);
+    if (params.min_ts != null) qs.set("min_ts", String(params.min_ts));
+    if (params.max_ts != null) qs.set("max_ts", String(params.max_ts));
+    qs.set("limit", String(params.limit ?? 1000));
+    if (params.cursor) qs.set("cursor", params.cursor);
+    return this.request<GetTradesResponse>("GET", `/markets/trades?${qs.toString()}`);
+  }
+
+  /**
+   * Paginate through all trades for a market. Caps at maxPages to guard
+   * against runaway calls on very chatty markets.
+   */
+  async getAllTrades(
+    ticker: string,
+    opts?: { min_ts?: number; max_ts?: number; maxPages?: number },
+  ): Promise<KalshiTrade[]> {
+    const all: KalshiTrade[] = [];
+    let cursor: string | undefined;
+    const maxPages = opts?.maxPages ?? 500;
+    let page = 0;
+    do {
+      const res = await this.getTrades({
+        ticker,
+        min_ts: opts?.min_ts,
+        max_ts: opts?.max_ts,
+        limit: 1000,
+        cursor,
+      });
+      all.push(...res.trades);
+      cursor = res.cursor || undefined;
+      page++;
+    } while (cursor && page < maxPages);
+    return all;
+  }
+
+  /**
+   * Get a single event with nested markets.
+   */
+  async getEvent(
+    eventTicker: string,
+    withNestedMarkets: boolean = true,
+  ): Promise<KalshiEvent | null> {
+    const qs = withNestedMarkets ? "?with_nested_markets=true" : "";
+    const res = await this.request<{ event: KalshiEvent }>(
+      "GET",
+      `/events/${eventTicker}${qs}`,
+    );
+    return res?.event ?? null;
+  }
+
+  /**
+   * Get a single market by ticker.
+   */
+  async getMarket(ticker: string): Promise<KalshiMarket | null> {
+    const res = await this.request<{ market: KalshiMarket }>(
+      "GET",
+      `/markets/${ticker}`,
+    );
+    return res?.market ?? null;
   }
 
   /**

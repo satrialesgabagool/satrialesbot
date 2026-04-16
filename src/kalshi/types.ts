@@ -90,6 +90,23 @@ export interface GetMarketsResponse {
   cursor: string;
 }
 
+// ─── Trades (public tape) ───────────────────────────────────────────
+
+export interface KalshiTrade {
+  trade_id: string;
+  ticker: string;
+  count_fp: string;
+  yes_price_dollars: string;
+  no_price_dollars: string;
+  taker_side: "yes" | "no";
+  created_time: string;      // ISO8601
+}
+
+export interface GetTradesResponse {
+  trades: KalshiTrade[];
+  cursor: string;
+}
+
 // ─── Order Book ─────────────────────────────────────────────────────
 
 export interface KalshiOrderBook {
