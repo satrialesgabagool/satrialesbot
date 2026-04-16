@@ -607,7 +607,16 @@ class KalshiSnipeHunter:
         market_key = f"kalshi-btc-{event_ticker}"
         self.market_stats.setdefault(market_key, {"trades": 0, "wins": 0, "pnl": 0.0})
 
-        window_id = f"kalshi-snipe-{event_ticker}-{ticker}"
+        # NOTE: window_id must be unique per trade. The same market/ticker
+        # can fire multiple times as the stage evolves (wide -> late -> prime),
+        # so we append stage + a millisecond timestamp. Without this, resolve_trade
+        # (which does UPDATE ... WHERE window_id = ?) would overwrite earlier
+        # rows with the PnL of whichever resolution ran first, losing per-trade
+        # data and breaking the total PnL sum in the DB.
+        window_id = (
+            f"kalshi-snipe-{event_ticker}-{ticker}-{stage}-"
+            f"{int(time.time() * 1000)}"
+        )
         model_name = f"kalshi_{stage}_{conviction}"
 
         pending = PendingKalshiTrade(
