@@ -9,6 +9,7 @@ Kalshi scanners. Kalshi-specific glue lives in `src/kalshi/weather/`.
 |------|---------|
 | **`WeatherEnsemble.ts`** | Multi-model forecast ensemble. Queries Open-Meteo (GFS, ICON, ECMWF seamless) + NOAA weather.gov. Returns `{date, highF_mean, highF_sigma, members[]}`. Also exports `ensembleBracketProbability(mean, spread, lo, hi, hours, members?)` — if `members` is passed, computes empirical probability; otherwise Gaussian. |
 | **`GFSEnsemble.ts`** | GEFS 31-member distribution fetcher via Open-Meteo `ensemble-api`. Returns full per-member daily highs/lows — used by bracket-probability math to replace the Gaussian assumption with an empirical count when available. Also exports `empiricalBracketProbability(members, lo, hi)`. |
+| **`METARObserver.ts`** | NOAA METAR same-day lock detector via `aviationweather.gov/api/data/metar`. Fetches last ~12h of ASOS observations for a city's primary airport station, identifies the day's peak temp, and decides whether the peak is "locked" (aged ≥ 2h, current ≥ 1.5°F below peak, local hour ≥ 15). Exports `detectSameDayLock(city, date)` and `lockedBracketProbability(peak, lo, hi)` (98/2 near-certainty). |
 | **`WeatherForecast.ts`** | Single-source forecast helper. Used when you only need one model, not the full ensemble. |
 | **`WeatherMarketFinder.ts`** | Interface `MarketFinderFn` + generic `WeatherMarket` type. Different exchanges supply their own implementation. |
 | **`WeatherScanner.ts`** | Generic scanner loop — used by Polymarket code. Kalshi has its own scanner in `src/kalshi/weather/`. |

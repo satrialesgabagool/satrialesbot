@@ -28,8 +28,8 @@ For each city:
 
 ## Expansion targets
 
-- **✅ GFS 31-member ensemble** — shipped. `fetchKalshiEnsemble()` now pulls the full GEFS distribution via `src/weather/GFSEnsemble.ts`. Each `KalshiEnsembleDay` optionally carries `highFMembers: number[]` (31 members when available). When present, the scanner routes through empirical bracket probability (`count(members in bracket) / n` with Laplace smoothing) instead of the Gaussian approximation — captures fat tails and skew.
-- **NOAA METAR same-day lock** (planned) — once observed airport temp is within 1-2°F of sunset forecast, bracket outcome is near-certain. Real-time obs from `aviationweather.gov` (no key needed).
+- **✅ GFS 31-member ensemble** — shipped. `fetchKalshiEnsemble()` now pulls the full GEFS distribution via `src/weather/GFSEnsemble.ts`. Each `KalshiEnsembleDay` optionally carries `highFMembers: number[]` (31 members when available, shifted to the aggregated consensus center). When present, the scanner routes through empirical bracket probability (`count(members in bracket) / n` with Laplace smoothing) instead of the Gaussian approximation — captures fat tails and skew.
+- **✅ NOAA METAR same-day lock** — shipped. When a KXHIGH market is within `metarLockHorizonHours` of close and resolves on today's local date, `WeatherScanner` queries the city's primary ASOS station via `aviationweather.gov`. If the day's peak is aged ≥2h, the current temp is ≥1.5°F below peak, and it's past 3pm local, the bracket probability flips to 0.98 (peak in bracket) / 0.02 (peak outside) — near-arbitrage when the market still prices on the forecast distribution. Tagged in signal metadata as `lockStatus: "locked-observed"`.
 
 ## Config knobs (`SimulatorConfig`)
 

@@ -22,6 +22,12 @@ import { findKalshiWeatherMarkets } from "../KalshiWeatherFinder";
 import type { WeatherMarket, TempBracket } from "../../weather/WeatherMarketFinder";
 import { HighConvictionLog, type HighConvictionRow } from "../output/HighConvictionLog";
 import { bracketProbability, fetchKalshiEnsemble, type KalshiEnsembleDay } from "./KalshiEnsemble";
+import {
+  detectSameDayLock,
+  lockedBracketProbability,
+  CITY_TO_STATION,
+  type METARLockResult,
+} from "../../weather/METARObserver";
 
 export interface WeatherScannerConfig {
   minEdgeBps: number;       // e.g. 500 → 5% edge required
@@ -30,6 +36,12 @@ export interface WeatherScannerConfig {
   minSources: number;       // e.g. 2 → need at least 2 forecast sources agreeing
   minLiquidity: number;     // e.g. 100 → skip if bracket has < 100 liquidity score
   intervalMs: number;       // scan cadence
+  /**
+   * When a market resolves within this many hours AND the target date is
+   * today (local), query NOAA METAR for the city's airport station to see
+   * if the day's high is already observed-locked. Disable by setting to 0.
+   */
+  metarLockHorizonHours: number;
 }
 
 export const DEFAULT_WEATHER_SCANNER_CONFIG: WeatherScannerConfig = {
@@ -39,6 +51,7 @@ export const DEFAULT_WEATHER_SCANNER_CONFIG: WeatherScannerConfig = {
   minSources: 3,
   minLiquidity: 50,
   intervalMs: 5 * 60 * 1000, // 5 minutes
+  metarLockHorizonHours: 10,
 };
 
 export class WeatherScanner {
@@ -93,7 +106,20 @@ export class WeatherScanner {
       }),
     );
 
+    // Per-scan METAR lock cache keyed by `${city}|${localDate}`. Populated
+    // lazily below — only when at least one market for a city is inside
+    // metarLockHorizonHours and its resolve date is local-today.
+    const lockCache = new Map<string, METARLockResult | null>();
+    const getLock = async (city: string, localDate: string): Promise<METARLockResult | null> => {
+      const key = `${city.toLowerCase()}|${localDate}`;
+      if (lockCache.has(key)) return lockCache.get(key)!;
+      const result = await detectSameDayLock(city, localDate);
+      lockCache.set(key, result);
+      return result;
+    };
+
     let hits = 0;
+    let lockedHits = 0;
     for (const market of markets) {
       const ensemble = ensembleByCity.get(market.city);
       if (!ensemble) continue;
@@ -101,25 +127,45 @@ export class WeatherScanner {
       const day = ensemble.days.find((d) => d.date === market.date);
       if (!day) continue;
 
-      if (day.sourceCount < this.config.minSources) continue;
-      if (day.spreadHighF > this.config.maxSpreadF) continue;
-
       const hoursLeft = (new Date(market.endDate).getTime() - Date.now()) / 3_600_000;
       if (hoursLeft > this.config.maxHorizonHours || hoursLeft <= 0) continue;
+
+      // METAR lock check: if we're within the METAR horizon AND this city
+      // has a known station, try the observed-lock path first. When locked,
+      // the forecast's model-spread and source-count gates do NOT apply —
+      // an observed peak doesn't care how much the pre-resolution forecasts
+      // disagreed, only that the peak is in the past.
+      let lock: METARLockResult | null = null;
+      if (
+        this.config.metarLockHorizonHours > 0 &&
+        hoursLeft <= this.config.metarLockHorizonHours &&
+        market.type === "high" &&
+        CITY_TO_STATION[market.city.toLowerCase()]
+      ) {
+        lock = await getLock(market.city, market.date);
+      }
+
+      // Only apply forecast-ensemble filters when we're NOT using a lock.
+      if (!lock?.locked) {
+        if (day.sourceCount < this.config.minSources) continue;
+        if (day.spreadHighF > this.config.maxSpreadF) continue;
+      }
 
       for (const b of market.brackets) {
         if (b.liquidity < this.config.minLiquidity) continue;
 
-        const row = this.evaluateBracket(market, b, day, hoursLeft);
+        const row = this.evaluateBracket(market, b, day, hoursLeft, lock);
         if (row) {
           this.log.append(row);
           hits++;
+          if (row.metadata.lockStatus === "locked-observed") lockedHits++;
         }
       }
     }
 
     const dt = Date.now() - t0;
-    console.log(`[weather] scan #${this.scanCount} done: ${hits} hits in ${dt}ms`);
+    const lockedTag = lockedHits > 0 ? ` (${lockedHits} METAR-locked)` : "";
+    console.log(`[weather] scan #${this.scanCount} done: ${hits} hits${lockedTag} in ${dt}ms`);
   }
 
   private evaluateBracket(
@@ -127,6 +173,7 @@ export class WeatherScanner {
     b: TempBracket,
     day: KalshiEnsembleDay,
     hoursLeft: number,
+    lock: METARLockResult | null,
   ): HighConvictionRow | null {
     const ensembleMean = market.type === "high" ? day.ensembleHighF : day.ensembleLowF;
     const spread = market.type === "high" ? day.spreadHighF : day.spreadLowF;
@@ -136,7 +183,19 @@ export class WeatherScanner {
     // fat tails and skew the Gaussian misses.
     const members = market.type === "high" ? day.highFMembers : day.lowFMembers;
 
-    const trueProb = bracketProbability(ensembleMean, spread, b.lowF, b.highF, hoursLeft, members);
+    // Priority of probability computation:
+    //   1. METAR lock — observed peak trumps any forecast
+    //   2. Empirical — GEFS 31-member count when available
+    //   3. Gaussian — horizon-based sigma, fallback
+    let trueProb: number;
+    let probMethod: "locked-observed" | "empirical-gfs31" | "gaussian";
+    if (lock?.locked && market.type === "high") {
+      trueProb = lockedBracketProbability(lock.peakTempF, b.lowF, b.highF);
+      probMethod = "locked-observed";
+    } else {
+      trueProb = bracketProbability(ensembleMean, spread, b.lowF, b.highF, hoursLeft, members);
+      probMethod = members && members.length >= 10 ? "empirical-gfs31" : "gaussian";
+    }
     const marketProb = b.outcomePrices[0];
     const edge = trueProb - marketProb;
     const edgeBps = Math.round(edge * 10000);
@@ -144,8 +203,11 @@ export class WeatherScanner {
     // Only want BUY-YES opportunities (trueProb > marketProb → undervalued yes).
     if (edgeBps < this.config.minEdgeBps) return null;
 
-    const conviction =
-      edge * day.agreement * Math.min(1, day.sourceCount / 5);
+    // Conviction: for locked-observed, max out (agreement=1, sources=5).
+    // For forecast-based, keep the existing agreement × source-count scaling.
+    const conviction = probMethod === "locked-observed"
+      ? edge * 1.0 * 1.0
+      : edge * day.agreement * Math.min(1, day.sourceCount / 5);
 
     return {
       timestamp: new Date().toISOString(),
@@ -157,7 +219,7 @@ export class WeatherScanner {
       sizeContracts: 0, // scanner only — no sizing here
       conviction: Math.round(conviction * 10000) / 10000,
       edgeBps,
-      reason: formatReason(market, b, day, trueProb, marketProb, hoursLeft),
+      reason: formatReason(market, b, day, trueProb, marketProb, hoursLeft, lock),
       metadata: {
         city: market.city,
         type: market.type,
@@ -174,8 +236,13 @@ export class WeatherScanner {
         volume24h: b.volume,
         liquidity: b.liquidity,
         // Which probability path fired, for after-the-fact analysis.
-        probMethod: members && members.length >= 10 ? "empirical-gfs31" : "gaussian",
+        probMethod,
         gfsMembers: members?.length ?? 0,
+        // Lock fields populated when probMethod === "locked-observed".
+        lockStatus: lock?.locked ? "locked-observed" : "forecast",
+        metarStation: lock?.station ?? null,
+        metarPeakF: lock?.peakTempF ?? null,
+        metarPeakAgeHours: lock?.peakAgeHours ?? null,
       },
     };
   }
@@ -188,9 +255,19 @@ function formatReason(
   trueProb: number,
   marketProb: number,
   hoursLeft: number,
+  lock: METARLockResult | null,
 ): string {
   const lo = isFinite(b.lowF) ? `${b.lowF}` : "-∞";
   const hi = isFinite(b.highF) ? `${b.highF}` : "+∞";
+  if (lock?.locked) {
+    return (
+      `${market.city} ${market.type} ${market.date} [${lo},${hi}°F]: ` +
+      `METAR-LOCKED peak=${lock.peakTempF}°F @ ${lock.station} ` +
+      `(${lock.peakAgeHours}h ago), ` +
+      `obs_p=${(trueProb * 100).toFixed(1)}% vs market=${(marketProb * 100).toFixed(1)}%, ` +
+      `h=${hoursLeft.toFixed(1)}h`
+    );
+  }
   return (
     `${market.city} ${market.type} ${market.date} [${lo},${hi}°F]: ` +
     `ensemble=${day.ensembleHighF.toFixed(1)}°F±${day.spreadHighF.toFixed(1)} ` +
