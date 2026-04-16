@@ -79,52 +79,103 @@ export class WeatherMarketFinder {
     this.series = opts.series ?? DEFAULT_WEATHER_SERIES;
   }
 
+  /**
+   * Scan all configured series for active weather events.
+   *
+   * Rate limiting: Kalshi basic tier allows ~20 reads/sec. We batch
+   * series in groups of BATCH_SIZE with BATCH_PAUSE_MS between batches
+   * to stay well under the limit (matches feig's approach).
+   */
   async findActive(): Promise<WeatherEvent[]> {
     const out: WeatherEvent[] = [];
+    const BATCH_SIZE = 5;
+    const BATCH_PAUSE_MS = 300;
 
-    for (const s of this.series) {
-      try {
-        const events: KalshiEvent[] = [];
-        for await (const e of this.client.paginateEvents({
-          seriesTicker: s.ticker,
-          status: "open",
-          withNestedMarkets: true,
-        })) {
-          events.push(e);
-        }
+    for (let i = 0; i < this.series.length; i += BATCH_SIZE) {
+      if (i > 0) await sleep(BATCH_PAUSE_MS);
 
-        for (const ev of events) {
-          const markets = (ev.markets ?? []).filter((m) => m.status === "active");
-          if (markets.length === 0) continue;
+      const batch = this.series.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(
+        batch.map((s) => this.fetchSeriesEvents(s)),
+      );
 
-          const brackets = markets.map(marketToBracket).filter((b): b is WeatherBracket => !!b);
-          if (brackets.length === 0) continue;
-
-          out.push({
-            eventTicker: ev.event_ticker,
-            seriesTicker: ev.series_ticker,
-            title: ev.title,
-            city: s.city,
-            type: s.type,
-            resolveDate: inferResolveDate(ev, markets),
-            closeTime: markets[0].close_time,
-            brackets,
-          });
-        }
-      } catch (err) {
-        // Soft-fail per series so one outage doesn't kill the whole scan.
-        console.warn(`[WeatherMarketFinder] series ${s.ticker} failed:`, (err as Error).message);
+      for (const events of batchResults) {
+        out.push(...events);
       }
     }
 
     return out;
   }
+
+  private async fetchSeriesEvents(
+    s: { ticker: string; city: string; type: "high" | "low" },
+  ): Promise<WeatherEvent[]> {
+    const out: WeatherEvent[] = [];
+    try {
+      const events: KalshiEvent[] = [];
+      for await (const e of this.client.paginateEvents({
+        seriesTicker: s.ticker,
+        status: "open",
+        withNestedMarkets: true,
+      })) {
+        events.push(e);
+      }
+
+      for (const ev of events) {
+        const markets = (ev.markets ?? []).filter((m) => m.status === "active");
+        if (markets.length === 0) continue;
+
+        const brackets = markets.map(marketToBracket).filter((b): b is WeatherBracket => !!b);
+        if (brackets.length === 0) continue;
+
+        out.push({
+          eventTicker: ev.event_ticker,
+          seriesTicker: ev.series_ticker,
+          title: ev.title,
+          city: s.city,
+          type: s.type,
+          resolveDate: inferResolveDate(ev, markets),
+          closeTime: markets[0].close_time,
+          brackets,
+        });
+      }
+    } catch (err) {
+      // Soft-fail per series so one outage doesn't kill the whole scan.
+      console.warn(`[WeatherMarketFinder] series ${s.ticker} failed:`, (err as Error).message);
+    }
+    return out;
+  }
 }
 
 function marketToBracket(m: KalshiMarket): WeatherBracket | null {
-  const lowF = m.floor_strike !== undefined ? m.floor_strike : -Infinity;
-  const highF = m.cap_strike !== undefined ? m.cap_strike : Infinity;
+  // Kalshi strike convention: strikes are EXCLUSIVE boundaries.
+  //   strike_type="less"    + cap_strike=84   → actual bracket ≤ 83°F (cap exclusive)
+  //   strike_type="greater" + floor_strike=91  → actual bracket ≥ 92°F (floor exclusive)
+  //   strike_type="between" + floor=83, cap=86 → actual bracket 84–85°F (both exclusive)
+  // Ref: feig branch already corrected for this; see PR review feedback.
+
+  let lowF: number;
+  let highF: number;
+  const st = m.strike_type ?? "";
+
+  if (st === "less" || (m.cap_strike !== undefined && m.floor_strike === undefined)) {
+    // Tail-low bracket: "X°F or below" — cap is exclusive upper bound
+    lowF = -Infinity;
+    highF = m.cap_strike !== undefined ? m.cap_strike - 1 : Infinity;
+  } else if (st === "greater" || (m.floor_strike !== undefined && m.cap_strike === undefined)) {
+    // Tail-high bracket: "X°F or above" — floor is exclusive lower bound
+    lowF = m.floor_strike !== undefined ? m.floor_strike + 1 : -Infinity;
+    highF = Infinity;
+  } else if (m.floor_strike !== undefined && m.cap_strike !== undefined) {
+    // Middle bracket: "X–Y°F" — both strikes exclusive
+    lowF = m.floor_strike + 1;
+    highF = m.cap_strike - 1;
+  } else {
+    return null; // no usable strike data
+  }
+
   if (lowF === -Infinity && highF === Infinity) return null;
+
   return {
     marketTicker: m.ticker,
     eventTicker: m.event_ticker,
@@ -137,6 +188,10 @@ function marketToBracket(m: KalshiMarket): WeatherBracket | null {
     liquidity: m.liquidity,
     closeTime: m.close_time,
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function inferResolveDate(ev: KalshiEvent, markets: KalshiMarket[]): string {

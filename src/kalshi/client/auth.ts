@@ -13,12 +13,28 @@
  * endpoints usable. That's fine for our scanners.
  */
 
-import { createSign, createPrivateKey } from "crypto";
+import { createSign, createPrivateKey, type KeyObject } from "crypto";
 
 export interface SignedHeaders {
   "KALSHI-ACCESS-KEY"?: string;
   "KALSHI-ACCESS-TIMESTAMP"?: string;
   "KALSHI-ACCESS-SIGNATURE"?: string;
+}
+
+/**
+ * Cache parsed private key objects to avoid expensive PEM parsing on
+ * every HTTP request. Keyed by PEM string so different keys (e.g.
+ * demo vs prod) each get their own cached entry.
+ */
+const keyCache = new Map<string, KeyObject>();
+
+function getOrCreateKey(pem: string): KeyObject {
+  let key = keyCache.get(pem);
+  if (!key) {
+    key = createPrivateKey({ key: pem, format: "pem" });
+    keyCache.set(pem, key);
+  }
+  return key;
 }
 
 export function signRequest(
@@ -32,10 +48,7 @@ export function signRequest(
   const timestamp = Date.now().toString();
   const msg = timestamp + method.toUpperCase() + pathWithPrefix;
 
-  const key = createPrivateKey({
-    key: privateKeyPem,
-    format: "pem",
-  });
+  const key = getOrCreateKey(privateKeyPem);
 
   const signer = createSign("RSA-SHA256");
   signer.update(msg);

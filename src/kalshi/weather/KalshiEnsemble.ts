@@ -19,8 +19,26 @@
  * → lower confidence in any single bracket.
  */
 
-import { fetchEnsembleForecast } from "../../weather/WeatherEnsemble";
+import {
+  fetchEnsembleForecast,
+  ensembleBracketProbability,
+} from "../../weather/WeatherEnsemble";
 import { loadPaidSources, type ForecastSource, type DailyTempForecast } from "./sources";
+
+/**
+ * Kalshi series use short abbreviations (lax, chi, mia…) but the free-tier
+ * ensemble in WeatherEnsemble.ts keys by full city names. This alias map
+ * bridges the gap. The fuzzy matcher handles cases like "chi" ⊂ "chicago",
+ * but "lax" ↔ "los angeles" has no substring overlap, so an explicit alias
+ * is required.
+ */
+const CITY_ALIASES: Record<string, string> = {
+  lax: "los angeles",
+  la: "los angeles",
+  sf: "san francisco",
+  phx: "phoenix",
+  dc: "washington",
+};
 
 export interface SourceSample {
   source: string;
@@ -67,8 +85,13 @@ export async function fetchKalshiEnsemble(
   daysAhead = 3,
   extraSources: ForecastSource[] = loadPaidSources(),
 ): Promise<KalshiEnsembleForecast | null> {
+  // Resolve Kalshi abbreviations to full city names for the free-tier
+  // ensemble (e.g. "lax" → "los angeles"). Paid sources already handle
+  // abbreviations via their own CITY_COORDS.
+  const resolvedCity = CITY_ALIASES[city.toLowerCase()] ?? city;
+
   // 1. Free-tier ensemble (Open-Meteo models + NOAA NWS for US cities).
-  const free = await fetchEnsembleForecast(city, daysAhead);
+  const free = await fetchEnsembleForecast(resolvedCity, daysAhead);
 
   // 2. Paid sources in parallel, filtering to configured ones only.
   const activePaid = extraSources.filter((s) => s.isConfigured());
@@ -125,53 +148,11 @@ export async function fetchKalshiEnsemble(
   };
 }
 
-/** Gaussian CDF via Abramowitz & Stegun approximation. */
-function normCdf(x: number): number {
-  const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989422804014327;
-  const p =
-    d *
-    Math.exp(-(x * x) / 2) *
-    (0.3193815 * t -
-      0.3565638 * t * t +
-      1.781478 * t * t * t -
-      1.8212560 * t * t * t * t +
-      1.3302744 * t * t * t * t * t);
-  return x >= 0 ? 1 - p : p;
-}
-
 /**
- * Probability that the actual value falls in [lowF, highF], given a
- * Gaussian with mean=ensembleF and sigma = RSS(baseSigma, spread).
+ * Re-export ensembleBracketProbability from the shared module as
+ * `bracketProbability`. Same Abramowitz & Stegun Gaussian CDF + RSS
+ * sigma combination — no need to duplicate it here.
  *
- * Use ±0.5°F rounding margin (Kalshi brackets are integer-bounded).
- * Pass −Infinity for lowF or +Infinity for highF on the tail brackets.
+ * Signature: (ensembleF, spreadF, lowF, highF, hoursUntilResolution) → [0,1]
  */
-export function bracketProbability(
-  ensembleF: number,
-  spreadF: number,
-  lowF: number,
-  highF: number,
-  hoursUntilResolution: number,
-): number {
-  const baseSigma =
-    hoursUntilResolution <= 12
-      ? 1.5
-      : hoursUntilResolution <= 24
-        ? 2.0
-        : hoursUntilResolution <= 48
-          ? 3.0
-          : hoursUntilResolution <= 72
-            ? 4.0
-            : 5.0;
-
-  const sigma = Math.sqrt(baseSigma ** 2 + spreadF ** 2);
-
-  const zLow = isFinite(lowF) ? (lowF - 0.5 - ensembleF) / sigma : -Infinity;
-  const zHigh = isFinite(highF) ? (highF + 0.5 - ensembleF) / sigma : Infinity;
-
-  const pLow = isFinite(zLow) ? normCdf(zLow) : 0;
-  const pHigh = isFinite(zHigh) ? normCdf(zHigh) : 1;
-
-  return Math.max(0, Math.min(1, pHigh - pLow));
-}
+export const bracketProbability = ensembleBracketProbability;

@@ -7,6 +7,21 @@
  * `privateKeyPem` are supplied in config.
  *
  * All prices returned/accepted are in CENTS (1..99).
+ *
+ * ── RECONCILIATION NOTE (for feig merge) ─────────────────────────────
+ * The feig branch has a Polymarket client at src/client/ with a
+ * different architecture (ClientInterface + SimClient, FixedPointDollars
+ * for prices). When feig adds its own Kalshi client, this code should be
+ * reconciled:
+ *   1. Adopt feig's price representation (FixedPointDollars) if the
+ *      shared engine expects it.
+ *   2. Implement feig's ClientInterface so the Kalshi backend can be
+ *      swapped into the existing Engine/strategy framework.
+ *   3. Merge type definitions — feig's types.ts uses string-dollar
+ *      prices; ours use integer cents. Pick one canonical form and
+ *      convert at the boundary.
+ * Until then this standalone client is fine for paper-mode scanning.
+ * ─────────────────────────────────────────────────────────────────────
  */
 
 import { fetchWithRetry } from "../../net/fetchWithRetry";
