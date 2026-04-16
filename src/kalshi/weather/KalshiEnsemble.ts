@@ -137,8 +137,14 @@ export async function fetchKalshiEnsemble(
 
   // GFS 31-member: add the member mean as one more "source" for the
   // aggregated mean/spread, AND keep the full member array keyed by date
-  // so the day object can carry it through to bracket-probability math.
-  const gfsMembersByDate = new Map<string, { highF: number[]; lowF: number[] }>();
+  // (with the raw GEFS mean) so we can shift it to the aggregated center
+  // later. The shift preserves the *shape* of the GEFS distribution
+  // (variance, skew, fat tails) while the *center* uses the full-ensemble
+  // consensus — otherwise a case like LAX where GEFS=74°F but ECMWF/NOAA=80°F
+  // would let empirical probability cluster around 74°F while the scanner's
+  // ensembleHighF (pulled toward 79°F) would be inconsistent.
+  interface GFSDayRaw { highMembers: number[]; lowMembers: number[]; highMean: number; lowMean: number }
+  const gfsRawByDate = new Map<string, GFSDayRaw>();
   if (gfs) {
     for (const d of gfs.days) {
       const highMean = d.highF_members.length > 0
@@ -154,8 +160,13 @@ export async function fetchKalshiEnsemble(
           highF: Math.round(highMean * 10) / 10,
           lowF: Math.round(lowMean * 10) / 10,
         });
+        gfsRawByDate.set(d.date, {
+          highMembers: d.highF_members,
+          lowMembers: d.lowF_members,
+          highMean,
+          lowMean,
+        });
       }
-      gfsMembersByDate.set(d.date, { highF: d.highF_members, lowF: d.lowF_members });
     }
   }
 
@@ -171,7 +182,21 @@ export async function fetchKalshiEnsemble(
     const ensembleLowF = mean(lows);
     const spreadHighF = stddev(highs);
     const spreadLowF = stddev(lows);
-    const gfsMembers = gfsMembersByDate.get(date);
+
+    // Shift GEFS members so they're centered on the aggregated consensus
+    // instead of on GEFS's own mean. Preserves the distributional shape
+    // while keeping the empirical probability consistent with the
+    // scanner's `ensembleHighF` center.
+    const raw = gfsRawByDate.get(date);
+    let highFMembers: number[] | undefined;
+    let lowFMembers: number[] | undefined;
+    if (raw) {
+      const highShift = ensembleHighF - raw.highMean;
+      const lowShift = ensembleLowF - raw.lowMean;
+      highFMembers = raw.highMembers.map((m) => m + highShift);
+      lowFMembers = raw.lowMembers.map((m) => m + lowShift);
+    }
+
     days.push({
       date,
       ensembleHighF: Math.round(ensembleHighF * 10) / 10,
@@ -181,8 +206,8 @@ export async function fetchKalshiEnsemble(
       agreement: Math.round(agreementScore(spreadHighF) * 100) / 100,
       sources: samples,
       sourceCount: samples.length,
-      highFMembers: gfsMembers?.highF,
-      lowFMembers: gfsMembers?.lowF,
+      highFMembers,
+      lowFMembers,
     });
   }
 
