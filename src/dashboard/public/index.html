@@ -84,6 +84,116 @@
       color: #fff;
     }
 
+    /* Secondary tabs (Historical, Forecast Accuracy) — same shape, softer
+       color so the live tabs read as primary at a glance. */
+    .tab-secondary {
+      color: #6e7681;
+      border-style: dashed;
+    }
+    .tab-secondary:hover { color: #c9d1d9; }
+    .tab-secondary.active {
+      background: #30363d;
+      border-color: #6e7681;
+      border-style: solid;
+      color: #e1e4e8;
+    }
+
+    /* "What is this tab?" banner — shown at the top of the secondary tabs
+       so the overlap with the paper trader is immediately clear. */
+    .tab-banner {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-left: 3px solid #58a6ff;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: #c9d1d9;
+      line-height: 1.5;
+    }
+    .tab-banner strong { color: #e1e4e8; }
+    .tab-banner code {
+      background: #0d1117; border: 1px solid #30363d;
+      padding: 1px 5px; border-radius: 3px;
+      font-size: 12px;
+    }
+
+    /* Conviction Pipeline — a funnel of 4 cards showing how many raw
+       signals narrow down to actual trades. Arrow between them makes the
+       flow legible. Lives at the top of the Signals tab. */
+    .pipeline {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .pipeline-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 14px 16px;
+      text-align: center;
+    }
+    .pipeline-card .label {
+      font-size: 11px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .pipeline-card .value {
+      font-size: 28px;
+      font-weight: 700;
+      margin: 4px 0 2px;
+    }
+    .pipeline-card .value.blue { color: #58a6ff; }
+    .pipeline-card .value.green { color: #3fb950; }
+    .pipeline-card .value.orange { color: #d29922; }
+    .pipeline-card .value.purple { color: #bc8cff; }
+    .pipeline-card .sub { font-size: 11px; color: #8b949e; }
+    .pipeline-arrow {
+      color: #484f58;
+      font-size: 22px;
+      font-weight: 300;
+      user-select: none;
+    }
+    @media (max-width: 900px) {
+      .pipeline { grid-template-columns: 1fr; }
+      .pipeline-arrow { display: none; }
+    }
+
+    /* Status pill used on the Signals table — shows for each signal
+       whether the paper trader took it, skipped it, or resolved it. */
+    .status-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+    .status-pill.open   { background: rgba(56, 139, 253, 0.15);  color: #58a6ff; border: 1px solid rgba(56, 139, 253, 0.4); }
+    .status-pill.won    { background: rgba(63, 185, 80, 0.15);   color: #3fb950; border: 1px solid rgba(63, 185, 80, 0.4); }
+    .status-pill.lost   { background: rgba(248, 81, 73, 0.15);   color: #f85149; border: 1px solid rgba(248, 81, 73, 0.4); }
+    .status-pill.skipped{ background: rgba(139, 148, 158, 0.12); color: #8b949e; border: 1px solid rgba(139, 148, 158, 0.35); }
+    .status-pill.pending{ background: rgba(210, 153, 34, 0.15);  color: #d29922; border: 1px solid rgba(210, 153, 34, 0.4); }
+    .status-pill.na     { color: #6e7681; }
+
+    /* Price-pair cell used on Paper Trader open positions — shows entry →
+       current with a colored delta in one line, replacing two separate
+       columns. */
+    .price-pair {
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .price-pair .arrow { color: #6e7681; margin: 0 4px; }
+    .price-pair .delta { font-size: 11px; margin-left: 6px; }
+
+    /* Urgency highlight for positions resolving soon (<= 1h). Applied to
+       the whole row so the user sees at a glance what needs attention. */
+    tr.urgent td { background: rgba(210, 153, 34, 0.07); }
+    tr.urgent td:last-child { color: #d29922; font-weight: 600; }
+
     .tab-content {
       display: none;
     }
@@ -455,48 +565,60 @@
     </div>
   </div>
 
-  <!-- Tab navigation -->
+  <!-- Tab navigation. Two primary tabs (Signals, Paper Trader) drive the
+       live view; two secondary tabs (Historical, Forecast Accuracy) exist
+       for offline evaluation and model calibration — see the banners on
+       those tabs for what makes them distinct from the live paper trader. -->
   <nav class="tabs">
-    <button class="tab active" data-tab="feed">Live Feed</button>
-    <button class="tab" data-tab="backtest">Backtest</button>
-    <button class="tab" data-tab="simulator">Simulator</button>
-    <button class="tab" data-tab="accuracy">Accuracy</button>
+    <button class="tab active" data-tab="feed">Signals</button>
+    <button class="tab" data-tab="simulator">Paper Trader</button>
+    <button class="tab tab-secondary" data-tab="backtest">Historical</button>
+    <button class="tab tab-secondary" data-tab="accuracy">Forecast Accuracy</button>
   </nav>
 
   <!-- ================================================================
-       TAB 1: LIVE FEED
+       TAB 1: SIGNALS
+       Shows the full scanner stream, cross-referenced with the paper
+       trader's decisions so each row is tagged TRADED / OPEN / WON /
+       LOST / SKIPPED. The Conviction Pipeline at the top makes the
+       funnel (scanned → high-conviction → currently trading → resolved)
+       immediately legible without scrolling.
        ================================================================ -->
   <div id="tab-feed" class="tab-content active">
 
-    <!-- Summary stat cards — updated via /api/stats -->
-    <div class="cards">
-      <div class="card">
-        <div class="label">Total Signals</div>
-        <div class="value blue" id="totalSignals">-</div>
+    <!-- Conviction Pipeline: scanned → high-conviction → trading → resolved.
+         The two arrow separators convey that this is a narrowing funnel:
+         lots of raw signals, a subset meet the edge gate, a subset of those
+         are currently open, and a subset of those have resolved. Populated
+         by updateConvictionPipeline() from /api/events + /api/sim/state. -->
+    <div class="pipeline">
+      <div class="pipeline-card">
+        <div class="label">Scanned</div>
+        <div class="value blue" id="pipeScanned">-</div>
+        <div class="sub" id="pipeScannedSub">weather + whale</div>
       </div>
-      <div class="card">
-        <div class="label">Weather Edges</div>
-        <div class="value green" id="weatherSignals">-</div>
+      <div class="pipeline-arrow">→</div>
+      <div class="pipeline-card">
+        <div class="label">High Conviction</div>
+        <div class="value purple" id="pipeHighConv">-</div>
+        <div class="sub" id="pipeHighConvSub">avg edge +-%</div>
       </div>
-      <div class="card">
-        <div class="label">Whale Alerts</div>
-        <div class="value orange" id="whaleSignals">-</div>
+      <div class="pipeline-arrow">→</div>
+      <div class="pipeline-card">
+        <div class="label">Currently Trading</div>
+        <div class="value orange" id="pipeOpen">-</div>
+        <div class="sub" id="pipeOpenSub">unrealized -</div>
       </div>
-      <div class="card">
-        <div class="label">Avg Edge</div>
-        <div class="value purple" id="avgEdge">-</div>
-      </div>
-      <div class="card">
-        <div class="label">Unique Markets</div>
-        <div class="value blue" id="uniqueMarkets">-</div>
-      </div>
-      <div class="card">
-        <div class="label">Last Signal</div>
-        <div class="value" id="lastUpdated" style="font-size:14px;color:#8b949e">-</div>
+      <div class="pipeline-arrow">→</div>
+      <div class="pipeline-card">
+        <div class="label">Resolved</div>
+        <div class="value green" id="pipeResolved">-</div>
+        <div class="sub" id="pipeResolvedSub">realized -</div>
       </div>
     </div>
 
-    <!-- Charts: edge distribution + signal timeline -->
+    <!-- Charts: edge distribution + signal timeline. Kept compact; the
+         pipeline cards above now carry the headline numbers. -->
     <div class="charts">
       <div class="chart-container">
         <h3>Edge Distribution (bps)</h3>
@@ -508,13 +630,15 @@
       </div>
     </div>
 
-    <!-- Live feed table -->
+    <!-- Signal table -->
     <div class="feed-header">
-      <h2>Live Feed</h2>
+      <h2>Signal Stream</h2>
       <div class="filter-pills">
         <button class="pill active" data-filter="all">All</button>
         <button class="pill" data-filter="weather">Weather</button>
         <button class="pill" data-filter="whale">Whale</button>
+        <button class="pill" data-filter="traded">Traded</button>
+        <button class="pill" data-filter="high-conviction">High Conviction</button>
       </div>
     </div>
 
@@ -527,7 +651,7 @@
           <th>Side</th>
           <th>Price</th>
           <th>Edge</th>
-          <th>Conviction</th>
+          <th>Status</th>
           <th>Reason</th>
         </tr>
       </thead>
@@ -538,15 +662,30 @@
 
     <div class="empty-state" id="emptyState">
       <h3>No signals yet</h3>
-      <p>Start a scanner: <code>bun run kalshi:weather</code> or <code>bun run kalshi:whale</code></p>
+      <p>Start a scanner: <code>bun run kalshi:weather</code>, <code>bun run kalshi:whale</code>, or <code>bun run demo</code></p>
     </div>
 
   </div>
 
   <!-- ================================================================
-       TAB 2: BACKTEST
+       TAB 2: HISTORICAL BACKTEST
+       Offline evaluation on real Open-Meteo archive days. Distinct from
+       the Paper Trader tab: the Paper Trader is a LIVE simulation driven
+       by the scanner's current signals; this tab answers "how would this
+       strategy have performed on the past N days?" by replaying archive
+       weather data against synthetic ensemble signals.
        ================================================================ -->
   <div id="tab-backtest" class="tab-content" style="display:none">
+
+    <div class="tab-banner">
+      <strong>What this tab is for:</strong> offline historical backtest against
+      Open-Meteo's archive API. Runs a one-shot evaluation on the last N days to
+      answer <em>"would this strategy have worked in the past?"</em> — separate
+      from the <strong>Paper Trader</strong> tab, which simulates on <em>live</em>
+      scanner signals in real time with the actual edge / cooldown / daily-cap
+      gates. Use this tab to tune model parameters; use Paper Trader to watch
+      live conviction.
+    </div>
 
     <!-- Config form -->
     <h2 style="margin-bottom:16px">Backtest Configuration</h2>
@@ -728,9 +867,17 @@
     </div>
 
     <!--
-      Open positions table — columns per spec:
-      Market | Direction | Contracts | Entry | Current | Model Prob | Edge at Entry
-             | Stake | Max Payout | Unrealized P&L | Status | Resolves At | Countdown
+      Open positions table — compact 8-column layout. Several fields that
+      were separate columns in the pre-audit design are now merged or
+      moved to hover tooltips:
+        - "Entry" and "Current" collapse into a single Price column
+          ("$0.38 → $0.48  +$0.10") so the trader can see movement at a
+          glance.
+        - "Stake" and "Max Payout" collapse into Risk / Max ("$49 / $131").
+        - "Resolves At" is on hover over the Countdown cell.
+        - "Model Prob" is surfaced via the Edge column tooltip.
+      Rows for positions resolving within an hour get a yellow .urgent
+      background so they jump out.
     -->
     <h3 class="section-title">Open Positions</h3>
     <div class="scrollable-table" style="margin-bottom:24px">
@@ -739,17 +886,13 @@
           <tr>
             <th>Market</th>
             <th>Dir</th>
-            <th>Contracts</th>
-            <th>Entry</th>
-            <th>Current</th>
-            <th>Model Prob</th>
+            <th>Ctr</th>
+            <th>Price (entry → curr)</th>
+            <th>Risk / Max</th>
+            <th>Unrealized</th>
             <th>Edge</th>
-            <th>Stake</th>
-            <th>Max Payout</th>
-            <th>Unrealized P&L</th>
             <th>Status</th>
-            <th>Resolves At</th>
-            <th>Countdown</th>
+            <th>Resolves In</th>
           </tr>
         </thead>
         <tbody id="simOpenBody"></tbody>
@@ -760,9 +903,9 @@
     </div>
 
     <!--
-      Closed positions table — columns per spec:
-      Market | Direction | Contracts | Entry | Outcome | Final P&L | Return %
-             | Fees | Resolved At
+      Closed positions table — compact 7-column layout. Entry + contracts
+      merge into the Price column; Fees paid shows as a subtle suffix on
+      the P&L column rather than a standalone column.
     -->
     <h3 class="section-title">Recent Closed Positions</h3>
     <div class="scrollable-table">
@@ -771,13 +914,11 @@
           <tr>
             <th>Market</th>
             <th>Dir</th>
-            <th>Contracts</th>
-            <th>Entry</th>
+            <th>Ctr × Entry</th>
             <th>Outcome</th>
-            <th>Final P&L</th>
-            <th>Return %</th>
-            <th>Fees</th>
-            <th>Resolved At</th>
+            <th>Net P&L</th>
+            <th>Return</th>
+            <th>Resolved</th>
           </tr>
         </thead>
         <tbody id="simClosedBody"></tbody>
@@ -790,9 +931,25 @@
   </div>
 
   <!-- ================================================================
-       TAB 4: ACCURACY
+       TAB 4: FORECAST ACCURACY
+       Pure model-calibration view — "how good has the forecast been
+       against actuals?" Independent of any trading simulation; answers
+       whether the edge model is calibrated to reality. Keep this tab
+       even though the Paper Trader exists: the Paper Trader tells you
+       whether you're making money today; this tab tells you whether the
+       forecasts the model is consuming are trustworthy.
        ================================================================ -->
   <div id="tab-accuracy" class="tab-content" style="display:none">
+
+    <div class="tab-banner">
+      <strong>What this tab is for:</strong> model-calibration check. Pulls
+      the last N days of NWS-forecast vs actual highs and shows MAE, std dev,
+      a forecast-vs-actual scatter, and a per-city error breakdown. This is
+      <em>independent</em> of the trading simulator — the numbers here tell
+      you whether the weather model feeding your edge calculation is
+      trustworthy. If MAE drifts up, every edge the scanner prints becomes
+      less reliable.
+    </div>
 
     <!-- Controls -->
     <div class="days-selector">
@@ -891,27 +1048,51 @@
     });
 
 
-    // ── Live Feed (existing code) ─────────────────────────────────
+    // ── Signals tab ───────────────────────────────────────────────
     let allEvents = [];       // All signals from the API
-    let activeFilter = "all"; // Current filter (all/weather/whale)
+    let activeFilter = "all"; // Current filter (all/weather/whale/traded/high-conviction)
     let edgeChart = null;     // Chart.js instance
     let timelineChart = null;
+    // Latest sim state cache so we can tag each signal row with its
+    // paper-trader status (TRADED / OPEN / WON / LOST / SKIPPED). Populated
+    // by the Paper Trader SSE stream — the Signals tab reads from the
+    // same cache so the two views agree.
+    let cachedSimState = null;
+    // Edge threshold used to highlight "high-conviction" signals. Pulled
+    // from the sim's config when available, else default 0.08 (matches
+    // the paper trader's default --min-edge). Kept as a decimal fraction.
+    let convictionMinEdge = 0.08;
 
     // 1. Load initial data
     async function loadInitialData() {
       try {
-        const [eventsRes, statsRes] = await Promise.all([
+        const [eventsRes, statsRes, simRes] = await Promise.all([
           fetch("/api/events"),
           fetch("/api/stats"),
+          // Fetch sim state eagerly so the Status column + Conviction
+          // Pipeline render on first paint rather than waiting for the
+          // first SSE push.
+          fetch("/api/sim/state").catch(() => null),
         ]);
 
         const eventsData = await eventsRes.json();
         const stats = await statsRes.json();
 
         allEvents = eventsData.events || [];
+        if (simRes && simRes.ok) {
+          try {
+            const simState = await simRes.json();
+            if (simState && simState.status !== 'no_state') cachedSimState = simState;
+            if (cachedSimState && cachedSimState.config && cachedSimState.config.minEdge != null) {
+              convictionMinEdge = cachedSimState.config.minEdge;
+            }
+          } catch (_) { /* ignore — sim isn't running */ }
+        }
+
         updateStats(stats);
         renderTable();
         updateCharts();
+        updateConvictionPipeline();
       } catch (err) {
         console.error("Failed to load data:", err);
       }
@@ -932,6 +1113,7 @@
         addTableRow(data, true);
         updateStatsFromEvents();
         updateCharts();
+        updateConvictionPipeline();
       };
 
       source.onerror = () => {
@@ -940,33 +1122,119 @@
       };
     }
 
-    // 3. Update stat cards
-    function updateStats(stats) {
-      document.getElementById("totalSignals").textContent = stats.totalSignals;
-      document.getElementById("weatherSignals").textContent = stats.weatherSignals;
-      document.getElementById("whaleSignals").textContent = stats.whaleSignals;
-      document.getElementById("avgEdge").textContent =
-        stats.avgEdgeBps > 0 ? `+${stats.avgEdgeBps}bp` : "-";
-      document.getElementById("uniqueMarkets").textContent = stats.uniqueMarkets;
-      document.getElementById("lastUpdated").textContent =
-        stats.lastUpdated ? new Date(stats.lastUpdated).toLocaleTimeString() : "-";
+    // 3. Stat cards are now consolidated into the Conviction Pipeline —
+    //    see updateConvictionPipeline(). The legacy updateStats /
+    //    updateStatsFromEvents hooks are kept as no-ops so the SSE
+    //    callbacks still work; they feed the pipeline updater instead.
+    function updateStats(_stats) { /* pipeline does this */ }
+    function updateStatsFromEvents() { /* pipeline does this */ }
+
+    /**
+     * Classify a single signal against the paper-trader's current state.
+     * Returns one of: 'open' (position still active), 'won', 'lost',
+     * 'traded' (any of the above), 'skipped' (high-conviction but no
+     * matching position — rejected by cooldown/daily-cap/dedup/etc.),
+     * 'pending' (high-conviction and recent enough that the trader may
+     * not have seen it yet), or 'na' (below edge threshold — never a
+     * candidate).
+     *
+     * Uses marketTicker for the lookup since that's the unique key both
+     * sides agree on. Falls back gracefully when no sim state is cached.
+     */
+    function classifySignal(ev) {
+      const isWeather = ev.strategy === 'weather';
+      const edgeFrac = ev.edgeBps != null ? ev.edgeBps / 10000 : 0;
+      const highConv = isWeather && edgeFrac >= convictionMinEdge;
+
+      if (!cachedSimState) {
+        return highConv ? 'pending' : 'na';
+      }
+
+      const ticker = ev.marketTicker;
+      const open = (cachedSimState.openPositions || []).find(p => p.marketTicker === ticker);
+      if (open) return 'open';
+      const closed = (cachedSimState.closedPositions || []).find(p => p.marketTicker === ticker);
+      if (closed) return closed.won ? 'won' : 'lost';
+      if (!highConv) return 'na';
+      // High-conviction but the sim didn't open it. If the signal is very
+      // recent (< 30s) call it pending — the trader file-watcher may not
+      // have picked it up yet. Otherwise it was actively skipped.
+      const ageMs = Date.now() - new Date(ev.timestamp).getTime();
+      if (ageMs < 30_000) return 'pending';
+      return 'skipped';
     }
 
-    function updateStatsFromEvents() {
-      const weather = allEvents.filter((e) => e.strategy === "weather");
-      const whale = allEvents.filter((e) => e.strategy === "whale");
-      const avgEdge = weather.length > 0
-        ? Math.round(weather.reduce((s, e) => s + e.edgeBps, 0) / weather.length)
+    /** Human-readable label + CSS class for a classifySignal() result. */
+    function statusPillForClass(cls) {
+      switch (cls) {
+        case 'open':    return { label: 'OPEN',    cssClass: 'open' };
+        case 'won':     return { label: 'WON',     cssClass: 'won' };
+        case 'lost':    return { label: 'LOST',    cssClass: 'lost' };
+        case 'skipped': return { label: 'SKIPPED', cssClass: 'skipped' };
+        case 'pending': return { label: 'PENDING', cssClass: 'pending' };
+        default:        return { label: '—',       cssClass: 'na' };
+      }
+    }
+
+    /**
+     * Compute + render the 4-card Conviction Pipeline: Scanned →
+     * High-Conviction → Currently Trading → Resolved. These four numbers
+     * answer the "what's the bot doing" question at a glance without
+     * needing to scan a long table.
+     */
+    function updateConvictionPipeline() {
+      const scanned = allEvents.length;
+      const weatherEvents = allEvents.filter(e => e.strategy === 'weather');
+      const whaleCount = scanned - weatherEvents.length;
+
+      const highConvEvents = weatherEvents.filter(e =>
+        (e.edgeBps != null ? e.edgeBps / 10000 : 0) >= convictionMinEdge
+      );
+      const highConvCount = highConvEvents.length;
+      const avgConvEdgeBps = highConvCount > 0
+        ? Math.round(highConvEvents.reduce((s, e) => s + (e.edgeBps || 0), 0) / highConvCount)
         : 0;
 
-      updateStats({
-        totalSignals: allEvents.length,
-        weatherSignals: weather.length,
-        whaleSignals: whale.length,
-        avgEdgeBps: avgEdge,
-        uniqueMarkets: new Set(allEvents.map((e) => e.marketTicker)).size,
-        lastUpdated: allEvents.length > 0 ? allEvents[allEvents.length - 1].timestamp : null,
-      });
+      const open = cachedSimState ? (cachedSimState.openPositions || []).length : 0;
+      const unrealized = cachedSimState ? num(cachedSimState.unrealizedPnlTotal, 0) : 0;
+      const resolved = cachedSimState ? (cachedSimState.closedPositions || []).length : 0;
+      const realized = cachedSimState ? num(cachedSimState.realizedPnl, 0) : 0;
+
+      document.getElementById('pipeScanned').textContent = scanned;
+      document.getElementById('pipeScannedSub').textContent =
+        `${weatherEvents.length} weather · ${whaleCount} whale`;
+
+      document.getElementById('pipeHighConv').textContent = highConvCount;
+      document.getElementById('pipeHighConvSub').textContent =
+        highConvCount > 0
+          ? `avg edge +${(avgConvEdgeBps / 100).toFixed(1)}% · gate ${(convictionMinEdge * 100).toFixed(0)}%+`
+          : `gate ${(convictionMinEdge * 100).toFixed(0)}%+`;
+
+      document.getElementById('pipeOpen').textContent = cachedSimState ? open : '—';
+      document.getElementById('pipeOpenSub').textContent = cachedSimState
+        ? `unrealized ${unrealized >= 0 ? '+' : ''}$${unrealized.toFixed(2)}`
+        : 'paper trader offline';
+
+      document.getElementById('pipeResolved').textContent = cachedSimState ? resolved : '—';
+      document.getElementById('pipeResolvedSub').textContent = cachedSimState
+        ? `realized ${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}`
+        : '';
+    }
+
+    /** Does this signal pass the current filter pill? */
+    function eventPassesFilter(ev) {
+      if (activeFilter === 'all') return true;
+      if (activeFilter === 'weather' || activeFilter === 'whale') {
+        return ev.strategy === activeFilter;
+      }
+      const cls = classifySignal(ev);
+      if (activeFilter === 'traded') return cls === 'open' || cls === 'won' || cls === 'lost';
+      if (activeFilter === 'high-conviction') {
+        // Weather + passes edge gate, regardless of whether sim took it.
+        return ev.strategy === 'weather' &&
+          (ev.edgeBps != null ? ev.edgeBps / 10000 : 0) >= convictionMinEdge;
+      }
+      return true;
     }
 
     // 4. Render the events table
@@ -974,10 +1242,7 @@
       const tbody = document.getElementById("feedBody");
       tbody.innerHTML = "";
 
-      const filtered = activeFilter === "all"
-        ? allEvents
-        : allEvents.filter((e) => e.strategy === activeFilter);
-
+      const filtered = allEvents.filter(eventPassesFilter);
       const sorted = [...filtered].reverse();
 
       document.getElementById("emptyState").style.display =
@@ -989,7 +1254,7 @@
     }
 
     function addTableRow(event, isNew) {
-      if (activeFilter !== "all" && event.strategy !== activeFilter) return;
+      if (!eventPassesFilter(event)) return;
 
       const tbody = document.getElementById("feedBody");
       document.getElementById("emptyState").style.display = "none";
@@ -1006,11 +1271,14 @@
       const edgeClass = event.edgeBps > 0 ? "edge-positive" : "edge-negative";
       const price = event.yesPrice ? `${event.yesPrice}c` : "-";
       const edge = event.edgeBps ? `+${event.edgeBps}bp` : "-";
-      const conviction = event.conviction ? event.conviction.toFixed(3) : "-";
 
+      // Truncate the reason to keep rows compact; full text on hover via title attr.
       const reason = event.reason
-        ? event.reason.length > 80 ? event.reason.slice(0, 80) + "..." : event.reason
+        ? event.reason.length > 70 ? event.reason.slice(0, 70) + "..." : event.reason
         : "-";
+
+      const cls = classifySignal(event);
+      const pill = statusPillForClass(cls);
 
       tr.innerHTML = `
         <td>${time}</td>
@@ -1019,8 +1287,8 @@
         <td>${event.side || "-"}</td>
         <td>${price}</td>
         <td class="${edgeClass}">${edge}</td>
-        <td>${conviction}</td>
-        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+        <td><span class="status-pill ${pill.cssClass}">${pill.label}</span></td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
             title="${(event.reason || '').replace(/"/g, '&quot;')}">${reason}</td>
       `;
     }
@@ -1497,8 +1765,19 @@
         updateSimEquityChart();
       }
 
-      // Capture state for the 1-second countdown re-render below.
+      // Capture state for the 1-second countdown re-render below, and
+      // push it into the Signals-tab cache so the Status column + the
+      // Conviction Pipeline stay in sync with the sim.
       simLastState = state;
+      cachedSimState = state;
+      if (state.config && state.config.minEdge != null) {
+        convictionMinEdge = state.config.minEdge;
+      }
+      updateConvictionPipeline();
+      // Re-render the signals table so status pills pick up any new
+      // OPEN / WON / LOST transitions. Cheap for the sizes we're dealing
+      // with (< few hundred rows).
+      renderTable();
 
       renderSimOpenPositions(state.openPositions || []);
       renderSimClosedPositions((state.closedPositions || []).slice(-50));
@@ -1600,10 +1879,13 @@
     }
 
     /**
-     * Render the open-positions table. Each Position row from the paper
-     * trader carries the authoritative fields listed in the SimState's
-     * Position type. We render them verbatim — no client-side math — so
-     * the UI can't get out of sync with the sim.
+     * Render the open-positions table with the compact 9-column layout.
+     * Merged cells:
+     *   Price column      = "$0.38 → $0.48 +$0.10" (entry → current + delta)
+     *   Risk/Max column   = "$49 / $131"           (stake / max payout)
+     *   Resolves In       = countdown + resolvesAtIso on hover
+     *   Edge              = edgeAtEntry + modelProbAtEntry on hover
+     * Positions resolving within 60 minutes get the .urgent row class.
      */
     function renderSimOpenPositions(positions) {
       const tbody = document.getElementById('simOpenBody');
@@ -1616,43 +1898,61 @@
       }
       empty.style.display = 'none';
 
-      // Use the state's simNowMs for countdown so BACKTEST mode advances at
-      // the accelerated rate. Server pushes SSE updates every 5s so the
-      // countdown gets re-rendered from the freshest simNowMs each tick.
       const simNowMs = simLastState && simLastState.simNowMs;
 
       for (const p of positions) {
         const tr = document.createElement('tr');
+        const entry = num(p.entryPrice, 0);
+        const curr = num(p.currentPrice, 0);
+        const delta = curr - entry;
+        const deltaClass = delta > 0.005 ? 'edge-positive' : delta < -0.005 ? 'edge-negative' : '';
+        const deltaStr = (delta >= 0 ? '+' : '') + '$' + Math.abs(delta).toFixed(2).replace(/^/, delta < 0 ? '-' : '');
+        // Simpler signed-money format:
+        const deltaSigned = (delta >= 0 ? '+' : '-') + '$' + Math.abs(delta).toFixed(2);
+
         const unrealized = num(p.unrealizedPnl, 0);
         const pnlClass = unrealized > 0.005 ? 'result-won' : unrealized < -0.005 ? 'result-lost' : '';
         const statusClass = p.status === 'IN_THE_MONEY' ? 'result-won'
                          : p.status === 'OUT_OF_MONEY' ? 'result-lost' : '';
         const statusLabel = (p.status || 'OPEN').replace(/_/g, ' ');
-        const edgePct = (num(p.edgeAtEntry, 0) * 100).toFixed(1) + '%';
-        const modelProbPct = (num(p.modelProbAtEntry, 0) * 100).toFixed(1) + '%';
+
+        const edgePct = (num(p.edgeAtEntry, 0) * 100).toFixed(0) + '%';
+        const modelProbPct = (num(p.modelProbAtEntry, 0) * 100).toFixed(0) + '%';
+        const edgeTooltip = `Model prob: ${modelProbPct}  ·  Entry edge: ${edgePct}`;
+
+        const resolvesAt = fmtIsoShort(p.resolvesAtIso);
+        const countdown = fmtCountdown(p.resolvesAtIso, simNowMs);
+        // Urgent-row highlight when countdown < 60 min (wall clock terms
+        // so BACKTEST mode advancing simNowMs also trips it correctly).
+        const msUntil = p.resolvesAtIso
+          ? new Date(p.resolvesAtIso).getTime() - (simNowMs || Date.now())
+          : Infinity;
+        if (msUntil > 0 && msUntil < 60 * 60 * 1000) tr.classList.add('urgent');
+
         tr.innerHTML = `
           <td style="font-family:monospace;font-size:12px">${p.marketName || p.marketTicker || '-'}</td>
           <td>${p.direction || '-'}</td>
           <td>${num(p.contracts, 0)}</td>
-          <td>$${num(p.entryPrice, 0).toFixed(2)}</td>
-          <td>$${num(p.currentPrice, 0).toFixed(2)}</td>
-          <td>${modelProbPct}</td>
-          <td class="edge-positive">${edgePct}</td>
-          <td>$${num(p.stake, 0).toFixed(2)}</td>
-          <td>$${num(p.maxPayout, 0).toFixed(2)}</td>
+          <td class="price-pair">
+            $${entry.toFixed(2)}<span class="arrow">→</span>$${curr.toFixed(2)}
+            <span class="delta ${deltaClass}">${deltaSigned}</span>
+          </td>
+          <td>$${num(p.stake, 0).toFixed(0)} <span style="color:#6e7681">/</span> $${num(p.maxPayout, 0).toFixed(0)}</td>
           <td class="${pnlClass}">${unrealized >= 0 ? '+' : ''}$${unrealized.toFixed(2)}</td>
+          <td class="edge-positive" title="${edgeTooltip}">${edgePct}</td>
           <td class="${statusClass}">${statusLabel}</td>
-          <td>${fmtIsoShort(p.resolvesAtIso)}</td>
-          <td>${fmtCountdown(p.resolvesAtIso, simNowMs)}</td>
+          <td title="${resolvesAt}">${countdown}</td>
         `;
         tbody.appendChild(tr);
       }
     }
 
     /**
-     * Render the closed-positions table. Final P&L is AFTER the Kalshi 7%
-     * fee has been applied (fees only hit on wins). Return % is signed
-     * decimal (0.47 → "+47.0%").
+     * Render the closed-positions table with the compact 7-column layout.
+     *   Ctr × Entry column merges contract count and entry price.
+     *   Net P&L carries the fee as a subtle suffix ("+$53.94 (fee $4.06)").
+     *   Return is signed percentage.
+     *   Resolved is a short date/time.
      */
     function renderSimClosedPositions(positions) {
       const tbody = document.getElementById('simClosedBody');
@@ -1665,7 +1965,6 @@
       }
       empty.style.display = 'none';
 
-      // Show newest first — closedPositions is appended to in open order.
       const sorted = [...positions].reverse();
 
       for (const p of sorted) {
@@ -1675,15 +1974,17 @@
         const netPnl = num(p.netPnl, 0);
         const pnlClass = netPnl >= 0 ? 'result-won' : 'result-lost';
         const retPct = (num(p.returnPct, 0) * 100).toFixed(1);
+        const fees = num(p.feesPaid, 0);
+        const feeSuffix = fees > 0
+          ? ` <span style="color:#6e7681;font-size:11px">(fee $${fees.toFixed(2)})</span>`
+          : '';
         tr.innerHTML = `
           <td style="font-family:monospace;font-size:12px">${p.marketName || p.marketTicker || '-'}</td>
           <td>${p.direction || '-'}</td>
-          <td>${num(p.contracts, 0)}</td>
-          <td>$${num(p.entryPrice, 0).toFixed(2)}</td>
+          <td>${num(p.contracts, 0)} × $${num(p.entryPrice, 0).toFixed(2)}</td>
           <td class="${outcomeClass}">${won ? 'WIN' : 'LOSS'}</td>
-          <td class="${pnlClass}">${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}</td>
+          <td class="${pnlClass}">${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}${feeSuffix}</td>
           <td class="${pnlClass}">${netPnl >= 0 ? '+' : ''}${retPct}%</td>
-          <td>$${num(p.feesPaid, 0).toFixed(2)}</td>
           <td>${fmtIsoShort(p.resolvedAtIso)}</td>
         `;
         tbody.appendChild(tr);
