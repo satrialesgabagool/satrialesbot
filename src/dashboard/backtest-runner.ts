@@ -7,6 +7,7 @@
 
 import { fetchWithRetry } from "../net/fetchWithRetry";
 import { bracketProbability } from "../weather/WeatherForecast";
+import { KALSHI_FEE_RATE, kalshiFee } from "./trading-math";
 
 // ─── Public interfaces ──────────────────────────────────────────────
 
@@ -27,6 +28,11 @@ export interface BacktestTrade {
   edge: number;            // model - market
   actualHighF: number;
   won: boolean;
+  /** Gross P&L before fees: stake returned + winnings, or −stake if loss. */
+  grossPnl: number;
+  /** Kalshi 7% fee on net winnings (0 on losses). */
+  feePaid: number;
+  /** Net P&L after fee — this is what hits `balance`. */
   pnl: number;
   balanceAfter: number;
 }
@@ -57,8 +63,21 @@ export interface BacktestResult {
     startBalance: number;
     endBalance: number;
     totalPnl: number;
+    /** Gross P&L before fees — useful for isolating fee drag. */
+    totalGrossPnl: number;
+    /** Total Kalshi fees paid across all winning trades. */
+    totalFeesPaid: number;
     roi: number;
     avgPnlPerTrade: number;
+    avgEdgeAtEntry: number;
+    avgEntryPrice: number;
+    /**
+     * Fraction of trades whose edge was below the fee-adjusted breakeven
+     * edge `fee_rate * (1 - entry_price)`. High values here mean the
+     * min-edge gate is too permissive given the entry prices being
+     * selected.
+     */
+    tradesBelowBreakeven: number;
   };
   /** Equity curve: balance after each trade */
   equityCurve: { tradeIndex: number; balance: number }[];
@@ -357,7 +376,14 @@ export async function runBacktest(
           actualHighF >= (isFinite(bracket.lowF) ? bracket.lowF : -Infinity) &&
           actualHighF <= (isFinite(bracket.highF) ? bracket.highF : Infinity);
 
-        const pnl = inBracket ? shares * 1.0 - cost : -cost;
+        // Gross = stake returned + $1/contract if won, else −stake.
+        // Fee applies to net winnings only, matching live Kalshi behavior
+        // and the paper-trader's settlement logic (trading-math.ts).
+        // Pre-audit this fee was silently 0%, which inflated backtest P&L
+        // by ~5–7% per winning trade — see LOSS_DIAGNOSIS.md.
+        const grossPnl = inBracket ? shares * 1.0 - cost : -cost;
+        const feePaid = kalshiFee(shares, marketPrice, inBracket);
+        const pnl = grossPnl - feePaid;
         balance += pnl;
 
         trades.push({
@@ -369,6 +395,8 @@ export async function runBacktest(
           edge,
           actualHighF,
           won: inBracket,
+          grossPnl,
+          feePaid,
           pnl,
           balanceAfter: balance,
         });
@@ -388,6 +416,24 @@ export async function runBacktest(
   const wins = trades.filter((t) => t.won).length;
   const losses = trades.length - wins;
   const totalPnl = balance - startBalance;
+  const totalGrossPnl = trades.reduce((s, t) => s + t.grossPnl, 0);
+  const totalFeesPaid = trades.reduce((s, t) => s + t.feePaid, 0);
+
+  const avgEdge =
+    trades.length > 0 ? trades.reduce((s, t) => s + t.edge, 0) / trades.length : 0;
+  const avgEntry =
+    trades.length > 0
+      ? trades.reduce((s, t) => s + t.entryPrice, 0) / trades.length
+      : 0;
+
+  // How many trades had edge BELOW the fee-adjusted breakeven? These
+  // should have been rejected by a min-edge gate that was aware of fees.
+  const tradesBelowBreakeven =
+    trades.length > 0
+      ? trades.filter(
+          (t) => t.edge < KALSHI_FEE_RATE * (1 - t.entryPrice),
+        ).length / trades.length
+      : 0;
 
   const summary = {
     totalTrades: trades.length,
@@ -397,8 +443,13 @@ export async function runBacktest(
     startBalance,
     endBalance: balance,
     totalPnl,
+    totalGrossPnl: Math.round(totalGrossPnl * 100) / 100,
+    totalFeesPaid: Math.round(totalFeesPaid * 100) / 100,
     roi: startBalance > 0 ? totalPnl / startBalance : 0,
     avgPnlPerTrade: trades.length > 0 ? totalPnl / trades.length : 0,
+    avgEdgeAtEntry: Math.round(avgEdge * 10000) / 10000,
+    avgEntryPrice: Math.round(avgEntry * 10000) / 10000,
+    tradesBelowBreakeven: Math.round(tradesBelowBreakeven * 10000) / 10000,
   };
 
   return {

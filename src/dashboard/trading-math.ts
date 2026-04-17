@@ -29,6 +29,65 @@
 export const KALSHI_FEE_RATE = 0.07;
 
 /**
+ * Minimum edge required for a YES trade to be break-even after Kalshi's fee.
+ *
+ * Derivation: buy 1 contract YES at entry price p; win with probability q.
+ *   EV_no_fee = q * (1 - p) + (1 - q) * (-p) = q - p   (= edge)
+ *   Fee of feeRate is charged on net winnings (1 - p) when we win, so
+ *   EV_with_fee = q * (1 - p) * (1 - feeRate) + (1 - q) * (-p)
+ * Setting EV_with_fee = 0 and solving for the minimum (q - p):
+ *   q_min - p = feeRate * (1 - p)
+ * i.e. the minimum post-fee-profitable edge grows linearly with the
+ * distance to the $1.00 payout ceiling.
+ *
+ * Examples at 7% fee:
+ *   entry 10¢  → 6.3% edge required
+ *   entry 30¢  → 4.9% edge required
+ *   entry 50¢  → 3.5% edge required
+ *   entry 70¢  → 2.1% edge required
+ *   entry 90¢  → 0.7% edge required
+ */
+export function computeBreakevenEdge(
+  entryPrice: number,
+  feeRate: number = KALSHI_FEE_RATE,
+): number {
+  if (entryPrice <= 0 || entryPrice >= 1) return 0;
+  return round4(feeRate * (1 - entryPrice));
+}
+
+/**
+ * Full Kelly optimal fraction of bankroll for a binary-outcome bet.
+ *
+ *   f* = edge / (1 - entryPrice)
+ *
+ * Note the fee-aware version substitutes `edge` with the post-fee edge:
+ *   edgePostFee = (modelProb - entryPrice) - feeRate * (1 - entryPrice)
+ *               = edge - breakevenEdge
+ *
+ * Returns 0 (pass) when the bet has no post-fee edge. The `kellyFraction`
+ * argument (typical 0.25 for "quarter Kelly") trades off growth rate for
+ * drawdown safety — full Kelly maximizes log-wealth growth but is brutal
+ * on a misspecified modelProb.
+ */
+export function kellySize(
+  modelProb: number,
+  entryPrice: number,
+  kellyFraction: number = 0.25,
+  feeRate: number = KALSHI_FEE_RATE,
+  maxFractionOfBankroll: number = 0.05,
+): number {
+  if (entryPrice <= 0 || entryPrice >= 1) return 0;
+  if (modelProb <= 0 || modelProb >= 1) return 0;
+  const edge = modelProb - entryPrice;
+  const breakeven = computeBreakevenEdge(entryPrice, feeRate);
+  const postFeeEdge = edge - breakeven;
+  if (postFeeEdge <= 0) return 0;
+  const fullKelly = postFeeEdge / (1 - entryPrice);
+  const f = Math.max(0, Math.min(maxFractionOfBankroll, fullKelly * kellyFraction));
+  return round4(f);
+}
+
+/**
  * Fee charged on a closed position. Only winning trades pay a fee, and only
  * on the winnings (not on the stake the trader already had skin in).
  */
