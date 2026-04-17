@@ -181,13 +181,16 @@ app.get("/api/sim/state", (c) => {
   if (!existsSync(STATE_PATH)) {
     return c.json({
       status: "no_state",
-      message: "No simulator state found. Run: bun run kalshi-weather-live.ts",
+      message:
+        "No simulator state found. Run: bun run src/dashboard/paper-trader.ts",
     });
   }
   try {
     const raw = readFileSync(STATE_PATH, "utf-8");
     const state = JSON.parse(raw);
-    return c.json({ status: "ok", state });
+    // Return the state flat (no wrapper) so the SSE stream and the initial
+    // fetch produce the same shape — simpler client code.
+    return c.json(state);
   } catch (err) {
     return c.json({ error: (err as Error).message }, 500);
   }

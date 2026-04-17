@@ -225,6 +225,11 @@ export class WeatherScanner {
         type: market.type,
         resolveDate: market.date,
         hoursLeft: Math.round(hoursLeft * 10) / 10,
+        // Absolute resolution timestamp in ISO-UTC. Carried so the paper
+        // trader / dashboard can compute a live countdown without having
+        // to also remember the signal's emit time. `hoursLeft` ages the
+        // moment it's written; `resolvesAtIso` is time-invariant.
+        resolvesAtIso: market.endDate,
         ensembleF: ensembleMean,
         spreadF: spread,
         sourceCount: day.sourceCount,

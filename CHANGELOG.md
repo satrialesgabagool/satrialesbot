@@ -4,7 +4,32 @@ High-level project history. For per-commit detail see `git log`.
 
 ## [Gas-bot] Unreleased — 2026-04-16
 
-### Added
+### Changed (simulation audit — full paper-trader rewrite)
+- **`src/dashboard/paper-trader.ts` rewritten end to end.** Prior version had a 15-second fake-resolve, no fees, no gates, accepted whale signals, and flooded the dashboard with thousands of synthetic trades driven by the demo seeder's 3-second cadence. New version:
+  - Only opens on `strategy === "weather"` signals
+  - Enforces edge gate (`--min-edge 0.08` default), daily cap (`--max-per-day 5`), cooldown (`--cooldown-min 30`), affordability, and dedup (same market+direction)
+  - Uses `metadata.resolvesAtIso` from the scanner (real Kalshi `close_time`) for resolution timing; falls back to `localMidnightIso(date+1, tz)` when absent
+  - Pre-draws outcome at open (`outcomeWin = Math.random() < modelProb`); price path between open and close is a Brownian bridge anchored to outcome (deterministic per position via seeded RNG)
+  - Settles with Kalshi's **7% fee on net winnings, winners only** — matches published fee schedule
+  - Dual mode: `--mode live` (real clock) or `--mode backtest --time-scale 60` (compressed clock)
+  - Atomic state writes (`tmp + renameSync`, Windows-safe fallback)
+  - Exports `__state`, `__placeTrade`, `__resolvePositions`, `__reset`, etc. for integration tests
+- **`src/dashboard/trading-math.ts` (new).** Pure functions — `kalshiFee`, `settlePosition`, `unrealizedPnl`, `isInTheMoney`, `accelPrice` (Brownian bridge), `edgeGate`, `formatCountdown`, `seededUniform`, `localDateKey`, `localMidnightIso`. No `fs`, no `Date.now`, no `Math.random` — callers inject time/RNG so tests are deterministic.
+- **`src/kalshi/weather/WeatherScanner.ts`** — added `resolvesAtIso: market.endDate` to signal metadata so the paper-trader has an absolute `close_time` instead of an aging `hoursLeft` decimal.
+- **`src/dashboard/seed-demo.ts` rewritten.** Emits realistic KXHIGH signals with full metadata (`resolvesAtIso`, `bracketLowF/highF`, `trueProb`, `marketProb`, `probMethod`, `lockStatus`). Edge varies in [5%, 22%] so the paper-trader's gates do real work. Configurable cadence via `--rate-sec`.
+- **Dashboard Simulator tab rewired to spec.** Open positions columns: Market · Direction · Contracts · Entry · Current · Model Prob · Edge · Stake · Max Payout · Unrealized P&L · Status · Resolves At · Countdown. Closed columns: Market · Direction · Contracts · Entry · Outcome · Final P&L · Return % · Fees · Resolved At. New summary cards: Total Portfolio Value · Available Cash · Realized P&L · Unrealized P&L · Wins/Losses · Fees Paid. Mode banner shows LIVE/BACKTEST + time-scale. Countdown ticks once per second between SSE pushes.
+- **`src/dashboard/server.ts`** — `/api/sim/state` now returns state flat (no `{status, state}` wrapper) for consistency with the SSE stream.
+
+### Added (audit)
+- **`src/dashboard/__tests__/trading-math.test.ts`** — 32 pure-math tests: fee rates, settlement, Brownian bridge endpoints, edge gate, countdown formatter, timezone helpers, RNG determinism.
+- **`src/dashboard/__tests__/paper-trader.test.ts`** — 14 integration tests: the 8-check validation spec (open reduces cash, no early resolve, win with 7% fee, loss = −stake, portfolio invariant, dedup, no NaN, gate enforcement over 10+ signals) plus a 100-trade win-rate sanity bonus.
+- **`.claude/skills/simulation-audit/SKILL.md`** — project-scoped skill that teaches future Claude sessions the audit checklist (bug list, dashboard column spec, LIVE vs BACKTEST, what to run, what NOT to do).
+- Test results: **46 pass / 0 fail / 314 expect() calls** (`bun test src/dashboard/__tests__/`).
+
+### Removed
+- Stale `state/weather-sim.json` holding 805 ghost trades from the pre-audit demo run.
+
+### Added (earlier today)
 - **NOAA METAR same-day lock** (`src/weather/METARObserver.ts` + scanner wiring) — once a market resolves today and the day's observed peak has aged ≥2h with current temp ≥1.5°F below peak and local time past 3pm, the scanner flips to observation-based probability (0.98 in-bracket, 0.02 out). Near-arbitrage when Kalshi markets still price on the wide forecast distribution post-peak. Live NYC check today: forecast said bracket [90-91°F] = 26% probability, but METAR peak locked at 88°F → real probability 2%. 24pp short edge. Signal metadata tags `lockStatus: "locked-observed"` and carries `metarStation`, `metarPeakF`, `metarPeakAgeHours`.
 - **GFS 31-member ensemble** (`src/weather/GFSEnsemble.ts`) — pulls the full GEFS distribution (1 control + 30 perturbed) from Open-Meteo's ensemble-api. `KalshiEnsembleDay` now carries an optional `highFMembers: number[]` (shifted to aggregated consensus center so GEFS shape is preserved but the mean stays consistent with all sources), and `ensembleBracketProbability()` uses an empirical count-based probability (with Laplace smoothing) when members are present instead of forcing a Gaussian. Live NYC smoke test confirms ~10 pp probability differences from Gaussian on tail brackets — real fat-tail and skew info the previous math was missing. Scanner signals now tag `metadata.probMethod = "locked-observed" | "empirical-gfs31" | "gaussian"` so we can measure which path is firing.
 - **Web dashboard** (`src/dashboard/`) — Hono + Bun server on :3000 with 4 live tabs:

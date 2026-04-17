@@ -682,83 +682,102 @@
     <div class="sim-status-bar">
       <span class="dot off" id="simDot"></span>
       <span id="simStatusText">No simulator running</span>
-      <span class="instructions">Start with: <code>bun run kalshi:sim</code></span>
+      <span class="instructions">Start with: <code>bun run src/dashboard/paper-trader.ts --mode live</code></span>
     </div>
 
-    <!-- Summary cards -->
+    <!-- Mode + config banner -->
+    <div class="sim-status-bar" id="simModeBar" style="background:#0d1117;border:1px solid #30363d">
+      <span id="simModeTag" style="font-weight:700;letter-spacing:0.08em">MODE: —</span>
+      <span id="simModeDetail" style="color:#8b949e;font-size:13px"></span>
+    </div>
+
+    <!-- Summary cards: Total Portfolio Value, Available Cash, Realized, Unrealized, Wins/Losses, Fees -->
     <div class="cards">
       <div class="card">
-        <div class="label">Balance</div>
-        <div class="value blue" id="simBalance">-</div>
+        <div class="label">Total Portfolio Value</div>
+        <div class="value blue" id="simPortfolioValue">-</div>
       </div>
       <div class="card">
-        <div class="label">Deployed</div>
-        <div class="value orange" id="simDeployed">-</div>
+        <div class="label">Available Cash</div>
+        <div class="value" id="simCash" style="color:#8b949e">-</div>
       </div>
       <div class="card">
-        <div class="label">Total P&L</div>
-        <div class="value green" id="simPnl">-</div>
+        <div class="label">Realized P&L</div>
+        <div class="value green" id="simRealizedPnl">-</div>
       </div>
       <div class="card">
-        <div class="label">Win / Loss</div>
-        <div class="value blue" id="simWinLoss">-</div>
+        <div class="label">Unrealized P&L</div>
+        <div class="value orange" id="simUnrealizedPnl">-</div>
       </div>
       <div class="card">
-        <div class="label">Open Positions</div>
-        <div class="value purple" id="simOpenCount">-</div>
+        <div class="label">Wins / Losses</div>
+        <div class="value purple" id="simWinLoss">-</div>
       </div>
       <div class="card">
-        <div class="label">Scans</div>
-        <div class="value" id="simScans" style="color:#8b949e">-</div>
+        <div class="label">Fees Paid</div>
+        <div class="value" id="simFees" style="color:#8b949e">-</div>
       </div>
     </div>
 
     <!-- Equity curve -->
     <div class="charts" style="grid-template-columns:1fr">
       <div class="chart-container">
-        <h3>Equity Curve</h3>
+        <h3>Portfolio Value</h3>
         <canvas id="simEquityChart"></canvas>
       </div>
     </div>
 
-    <!-- Open positions table -->
+    <!--
+      Open positions table — columns per spec:
+      Market | Direction | Contracts | Entry | Current | Model Prob | Edge at Entry
+             | Stake | Max Payout | Unrealized P&L | Status | Resolves At | Countdown
+    -->
     <h3 class="section-title">Open Positions</h3>
-    <div style="margin-bottom:24px">
+    <div class="scrollable-table" style="margin-bottom:24px">
       <table>
         <thead>
           <tr>
-            <th>City</th>
-            <th>Date</th>
-            <th>Type</th>
-            <th>Bracket</th>
-            <th>Shares</th>
-            <th>Entry Price</th>
-            <th>Cost</th>
-            <th>Forecast Prob</th>
+            <th>Market</th>
+            <th>Dir</th>
+            <th>Contracts</th>
+            <th>Entry</th>
+            <th>Current</th>
+            <th>Model Prob</th>
             <th>Edge</th>
-            <th>Hours to Resolution</th>
+            <th>Stake</th>
+            <th>Max Payout</th>
+            <th>Unrealized P&L</th>
+            <th>Status</th>
+            <th>Resolves At</th>
+            <th>Countdown</th>
           </tr>
         </thead>
         <tbody id="simOpenBody"></tbody>
       </table>
-      <div class="empty-state" id="simOpenEmpty" style="padding:30px 20px">
-        <p>No open positions</p>
-      </div>
+    </div>
+    <div class="empty-state" id="simOpenEmpty" style="padding:30px 20px">
+      <p>No open positions</p>
     </div>
 
-    <!-- Closed positions table -->
+    <!--
+      Closed positions table — columns per spec:
+      Market | Direction | Contracts | Entry | Outcome | Final P&L | Return %
+             | Fees | Resolved At
+    -->
     <h3 class="section-title">Recent Closed Positions</h3>
     <div class="scrollable-table">
       <table>
         <thead>
           <tr>
-            <th>City</th>
-            <th>Date</th>
-            <th>Bracket</th>
+            <th>Market</th>
+            <th>Dir</th>
+            <th>Contracts</th>
             <th>Entry</th>
-            <th>Result</th>
-            <th>Actual Temp</th>
-            <th>P&L</th>
+            <th>Outcome</th>
+            <th>Final P&L</th>
+            <th>Return %</th>
+            <th>Fees</th>
+            <th>Resolved At</th>
           </tr>
         </thead>
         <tbody id="simClosedBody"></tbody>
@@ -1358,6 +1377,11 @@
     let simEquityChart = null;
     let simEventSource = null;
     let simEquityData = [];
+    // Last full state pushed by the SSE stream. Used by the 1-second
+    // countdown re-render so "Resolves in 4h 22m" ticks smoothly between
+    // the (slower) SSE pushes — we reuse the last positions list and only
+    // rewrite the countdown column.
+    let simLastState = null;
 
     function initSimulator() {
       simInitialized = true;
@@ -1404,43 +1428,132 @@
       };
     }
 
+    // ── updateSimUI ────────────────────────────────────────────────
+    // Consumes the paper-trader's state JSON (see src/dashboard/paper-trader.ts
+    // `SimState` type). Key fields used here:
+    //   mode, timeScale, config          — banner
+    //   availableCash, totalPortfolioValue — top cards
+    //   realizedPnl, unrealizedPnlTotal, totalFeesPaid — top cards
+    //   wins, losses                     — top card
+    //   openPositions[]  → open-positions table
+    //   closedPositions[] → closed-positions table (slice last 50)
     function updateSimUI(state) {
-      // Summary cards
-      const balance = state.balance != null ? state.balance : 0;
-      const deployed = state.deployed != null ? state.deployed : 0;
-      const pnl = state.totalPnl != null ? state.totalPnl : 0;
-      const wins = state.wins != null ? state.wins : 0;
-      const losses = state.losses != null ? state.losses : 0;
-      const openCount = state.positions ? state.positions.length : 0;
-      const scans = state.scans != null ? state.scans : 0;
+      // Handle the "no_state" shape returned by /api/sim/state when the
+      // sim process hasn't started yet. Every field defaults to zero so
+      // the UI renders cleanly instead of NaN / undefined.
+      if (!state || state.status === 'no_state') {
+        state = {};
+      }
 
-      document.getElementById('simBalance').textContent = '$' + balance.toFixed(2);
-      document.getElementById('simDeployed').textContent = '$' + deployed.toFixed(2);
+      // Mode banner
+      const mode = state.mode || (state.config && state.config.mode) || '—';
+      const timeScale = state.timeScale || (state.config && state.config.timeScale) || 1;
+      const cfg = state.config || {};
+      document.getElementById('simModeTag').textContent = 'MODE: ' + mode;
+      document.getElementById('simModeTag').style.color =
+        mode === 'BACKTEST' ? '#a371f7' : mode === 'LIVE' ? '#3fb950' : '#8b949e';
+      const detail = mode === 'BACKTEST'
+        ? `accelerated ${timeScale}× (1 real sec = ${timeScale} sim min)`
+        : mode === 'LIVE'
+        ? `real clock`
+        : '';
+      const cfgTxt = cfg.minEdge != null
+        ? ` · size $${cfg.positionSize} · min-edge ${(cfg.minEdge * 100).toFixed(1)}% · max ${cfg.maxPerDay}/day · cooldown ${cfg.cooldownMin}m · fee ${(cfg.kalshiFeeRate * 100).toFixed(1)}%`
+        : '';
+      document.getElementById('simModeDetail').textContent = detail + cfgTxt;
 
-      const pnlEl = document.getElementById('simPnl');
-      pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-      pnlEl.className = 'value ' + (pnl >= 0 ? 'green' : 'red');
+      // Summary numbers
+      const cash        = num(state.availableCash, 0);
+      const pv          = num(state.totalPortfolioValue, cash);
+      const realized    = num(state.realizedPnl, 0);
+      const unrealized  = num(state.unrealizedPnlTotal, 0);
+      const wins        = num(state.wins, 0);
+      const losses      = num(state.losses, 0);
+      const fees        = num(state.totalFeesPaid, 0);
+      const nTotal      = wins + losses;
+      const winRate     = nTotal > 0 ? ((wins / nTotal) * 100).toFixed(1) + '%' : '—';
 
-      document.getElementById('simWinLoss').textContent = wins + ' / ' + losses;
-      document.getElementById('simOpenCount').textContent = openCount;
-      document.getElementById('simScans').textContent = scans;
+      document.getElementById('simPortfolioValue').textContent = '$' + pv.toFixed(2);
+      document.getElementById('simCash').textContent = '$' + cash.toFixed(2);
 
-      // Track equity for chart — cap at 200 points to prevent chart lag
-      // Only add a new point if balance actually changed (avoid duplicate ticks from countdown updates)
+      const realizedEl = document.getElementById('simRealizedPnl');
+      realizedEl.textContent = (realized >= 0 ? '+' : '') + '$' + realized.toFixed(2);
+      realizedEl.className = 'value ' + (realized >= 0 ? 'green' : 'red');
+
+      const unrealizedEl = document.getElementById('simUnrealizedPnl');
+      unrealizedEl.textContent = (unrealized >= 0 ? '+' : '') + '$' + unrealized.toFixed(2);
+      unrealizedEl.className = 'value ' + (unrealized >= 0 ? 'green' : 'red');
+
+      document.getElementById('simWinLoss').textContent =
+        `${wins} / ${losses}  (${winRate})`;
+      document.getElementById('simFees').textContent = '$' + fees.toFixed(2);
+
+      // Equity curve tracks TOTAL PORTFOLIO VALUE (cash + open-position MTM),
+      // not just cash — this is the invariant the spec cares about.
       const lastPoint = simEquityData[simEquityData.length - 1];
-      if (lastPoint == null || Math.abs(lastPoint - balance) > 0.001) {
-        simEquityData.push(balance);
-        if (simEquityData.length > 200) {
-          simEquityData.shift();
-        }
+      if (lastPoint == null || Math.abs(lastPoint - pv) > 0.001) {
+        simEquityData.push(pv);
+        if (simEquityData.length > 200) simEquityData.shift();
         updateSimEquityChart();
       }
 
-      // Open positions table
-      renderSimOpenPositions(state.positions || []);
+      // Capture state for the 1-second countdown re-render below.
+      simLastState = state;
 
-      // Closed positions table (cap displayed rows for perf)
+      renderSimOpenPositions(state.openPositions || []);
       renderSimClosedPositions((state.closedPositions || []).slice(-50));
+    }
+
+    // Re-render the open-positions table once per second so the Countdown
+    // column ticks smoothly. We reuse simLastState rather than re-fetching,
+    // and skip entirely if the Simulator tab isn't visible or no state
+    // has arrived yet.
+    setInterval(() => {
+      const simTab = document.getElementById('tab-simulator');
+      if (!simLastState || !simTab || simTab.style.display === 'none') return;
+      // Advance simLastState.simNowMs locally between SSE pushes so the
+      // countdown is monotonically decreasing rather than jumping by 5s.
+      // In BACKTEST the server's push already carries the fast-forwarded
+      // simNowMs; we add 1000ms per real second, which is CLOSE ENOUGH for
+      // rendering (the next SSE push will correct any drift).
+      if (simLastState.mode === 'BACKTEST' && simLastState.timeScale) {
+        simLastState.simNowMs = (simLastState.simNowMs || Date.now()) + 1000 * simLastState.timeScale * 60;
+      } else {
+        simLastState.simNowMs = Date.now();
+      }
+      renderSimOpenPositions(simLastState.openPositions || []);
+    }, 1000);
+
+    function num(v, fallback) {
+      return typeof v === 'number' && isFinite(v) ? v : fallback;
+    }
+
+    /** Format an ISO timestamp as "Apr 18, 12:00 AM" (local time). */
+    function fmtIsoShort(iso) {
+      if (!iso) return '-';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '-';
+      return d.toLocaleString(undefined, {
+        month: 'short', day: 'numeric',
+        hour: 'numeric', minute: '2-digit',
+      });
+    }
+
+    /** "4h 22m" / "58s" / "Resolved" — counts down to resolvesAtIso using
+     *  the simulated clock (simNowMs) so BACKTEST mode updates match the
+     *  paper-trader's view of time. Falls back to wall-clock if missing. */
+    function fmtCountdown(resolvesAtIso, simNowMs) {
+      if (!resolvesAtIso) return '-';
+      const end = new Date(resolvesAtIso).getTime();
+      const now = simNowMs || Date.now();
+      const ms = end - now;
+      if (ms <= 0) return 'Resolved';
+      const s = Math.floor(ms / 1000);
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm';
+      if (m > 0) return m + 'm ' + String(s % 60).padStart(2, '0') + 's';
+      return s + 's';
     }
 
     function updateSimEquityChart() {
@@ -1449,7 +1562,7 @@
       const chartData = {
         labels: simEquityData.map((_, i) => i),
         datasets: [{
-          label: 'Balance',
+          label: 'Portfolio Value',
           data: simEquityData,
           borderColor: '#3fb950',
           backgroundColor: 'rgba(63, 185, 80, 0.1)',
@@ -1478,7 +1591,7 @@
               y: {
                 grid: { color: '#21262d' },
                 ticks: { color: '#8b949e' },
-                title: { display: true, text: 'Balance ($)', color: '#8b949e' },
+                title: { display: true, text: 'Portfolio Value ($)', color: '#8b949e' },
               },
             },
           },
@@ -1486,68 +1599,92 @@
       }
     }
 
+    /**
+     * Render the open-positions table. Each Position row from the paper
+     * trader carries the authoritative fields listed in the SimState's
+     * Position type. We render them verbatim — no client-side math — so
+     * the UI can't get out of sync with the sim.
+     */
     function renderSimOpenPositions(positions) {
       const tbody = document.getElementById('simOpenBody');
       const empty = document.getElementById('simOpenEmpty');
       tbody.innerHTML = '';
 
-      if (positions.length === 0) {
+      if (!positions || positions.length === 0) {
         empty.style.display = 'block';
         return;
       }
       empty.style.display = 'none';
 
+      // Use the state's simNowMs for countdown so BACKTEST mode advances at
+      // the accelerated rate. Server pushes SSE updates every 5s so the
+      // countdown gets re-rendered from the freshest simNowMs each tick.
+      const simNowMs = simLastState && simLastState.simNowMs;
+
       for (const p of positions) {
         const tr = document.createElement('tr');
-        const bracketLabel = p.lowF != null && p.highF != null
-          ? p.lowF + '-' + p.highF + 'F'
-          : (p.bracket || '-');
-        const hoursLeft = p.hoursToResolution != null
-          ? p.hoursToResolution.toFixed(1) + 'h'
-          : '-';
+        const unrealized = num(p.unrealizedPnl, 0);
+        const pnlClass = unrealized > 0.005 ? 'result-won' : unrealized < -0.005 ? 'result-lost' : '';
+        const statusClass = p.status === 'IN_THE_MONEY' ? 'result-won'
+                         : p.status === 'OUT_OF_MONEY' ? 'result-lost' : '';
+        const statusLabel = (p.status || 'OPEN').replace(/_/g, ' ');
+        const edgePct = (num(p.edgeAtEntry, 0) * 100).toFixed(1) + '%';
+        const modelProbPct = (num(p.modelProbAtEntry, 0) * 100).toFixed(1) + '%';
         tr.innerHTML = `
-          <td>${p.city || '-'}</td>
-          <td>${p.date || '-'}</td>
-          <td>${p.type || 'YES'}</td>
-          <td style="font-family:monospace;font-size:12px">${bracketLabel}</td>
-          <td>${p.shares != null ? p.shares : '-'}</td>
-          <td>${p.entryPrice != null ? p.entryPrice.toFixed(2) : '-'}</td>
-          <td>$${p.cost != null ? p.cost.toFixed(2) : '-'}</td>
-          <td>${p.forecastProb != null ? p.forecastProb.toFixed(3) : '-'}</td>
-          <td class="edge-positive">${p.edge != null ? p.edge.toFixed(3) : '-'}</td>
-          <td>${hoursLeft}</td>
+          <td style="font-family:monospace;font-size:12px">${p.marketName || p.marketTicker || '-'}</td>
+          <td>${p.direction || '-'}</td>
+          <td>${num(p.contracts, 0)}</td>
+          <td>$${num(p.entryPrice, 0).toFixed(2)}</td>
+          <td>$${num(p.currentPrice, 0).toFixed(2)}</td>
+          <td>${modelProbPct}</td>
+          <td class="edge-positive">${edgePct}</td>
+          <td>$${num(p.stake, 0).toFixed(2)}</td>
+          <td>$${num(p.maxPayout, 0).toFixed(2)}</td>
+          <td class="${pnlClass}">${unrealized >= 0 ? '+' : ''}$${unrealized.toFixed(2)}</td>
+          <td class="${statusClass}">${statusLabel}</td>
+          <td>${fmtIsoShort(p.resolvesAtIso)}</td>
+          <td>${fmtCountdown(p.resolvesAtIso, simNowMs)}</td>
         `;
         tbody.appendChild(tr);
       }
     }
 
+    /**
+     * Render the closed-positions table. Final P&L is AFTER the Kalshi 7%
+     * fee has been applied (fees only hit on wins). Return % is signed
+     * decimal (0.47 → "+47.0%").
+     */
     function renderSimClosedPositions(positions) {
       const tbody = document.getElementById('simClosedBody');
       const empty = document.getElementById('simClosedEmpty');
       tbody.innerHTML = '';
 
-      if (positions.length === 0) {
+      if (!positions || positions.length === 0) {
         empty.style.display = 'block';
         return;
       }
       empty.style.display = 'none';
 
-      // Show newest first
+      // Show newest first — closedPositions is appended to in open order.
       const sorted = [...positions].reverse();
 
       for (const p of sorted) {
         const tr = document.createElement('tr');
-        const resultClass = p.won ? 'result-won' : 'result-lost';
-        const resultText = p.won ? 'WON' : 'LOST';
-        const pnlSign = p.pnl >= 0 ? '+' : '';
+        const won = !!p.won;
+        const outcomeClass = won ? 'result-won' : 'result-lost';
+        const netPnl = num(p.netPnl, 0);
+        const pnlClass = netPnl >= 0 ? 'result-won' : 'result-lost';
+        const retPct = (num(p.returnPct, 0) * 100).toFixed(1);
         tr.innerHTML = `
-          <td>${p.city || '-'}</td>
-          <td>${p.date || '-'}</td>
-          <td style="font-family:monospace;font-size:12px">${p.bracket || '-'}</td>
-          <td>${p.entry != null ? p.entry.toFixed(2) : '-'}</td>
-          <td class="${resultClass}">${resultText}</td>
-          <td>${p.actualTemp != null ? p.actualTemp + 'F' : '-'}</td>
-          <td class="${p.pnl >= 0 ? 'result-won' : 'result-lost'}">${pnlSign}$${p.pnl != null ? p.pnl.toFixed(2) : '0.00'}</td>
+          <td style="font-family:monospace;font-size:12px">${p.marketName || p.marketTicker || '-'}</td>
+          <td>${p.direction || '-'}</td>
+          <td>${num(p.contracts, 0)}</td>
+          <td>$${num(p.entryPrice, 0).toFixed(2)}</td>
+          <td class="${outcomeClass}">${won ? 'WIN' : 'LOSS'}</td>
+          <td class="${pnlClass}">${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)}</td>
+          <td class="${pnlClass}">${netPnl >= 0 ? '+' : ''}${retPct}%</td>
+          <td>$${num(p.feesPaid, 0).toFixed(2)}</td>
+          <td>${fmtIsoShort(p.resolvedAtIso)}</td>
         `;
         tbody.appendChild(tr);
       }
