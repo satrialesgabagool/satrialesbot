@@ -35,11 +35,16 @@ import {
  * Override any field via `overrides`.
  */
 function signal(overrides: Partial<Signal> & { marketTicker?: string } = {}): Signal {
+  // Dynamic resolve timestamp — 24h+ from "now" — so the test doesn't age
+  // past its hardcoded resolve time as wall clock advances.
+  const resolvesAtMs = Date.now() + 24 * 60 * 60 * 1000;
+  const resolvesAtIso = new Date(resolvesAtMs).toISOString();
+  const resolveDate = resolvesAtIso.slice(0, 10);
   const base: Signal = {
     timestamp: new Date().toISOString(),
     strategy: "weather",
-    eventTicker: "KXHIGHNY-26APR17",
-    marketTicker: "KXHIGHNY-26APR17-T72",
+    eventTicker: "KXHIGHNY-TEST",
+    marketTicker: "KXHIGHNY-TEST-T72",
     side: "yes",
     yesPrice: 45,
     conviction: 0.2,
@@ -48,8 +53,8 @@ function signal(overrides: Partial<Signal> & { marketTicker?: string } = {}): Si
     metadata: {
       city: "New York City",
       type: "high",
-      resolveDate: "2026-04-17",
-      resolvesAtIso: "2026-04-18T04:00:00.000Z", // 24h+ from our default sim start
+      resolveDate,
+      resolvesAtIso,
       bracketLowF: 72,
       bracketHighF: 73,
       trueProb: 0.70,

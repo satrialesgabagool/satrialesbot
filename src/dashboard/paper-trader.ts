@@ -53,6 +53,8 @@ import {
   settlePosition,
   unrealizedPnl,
 } from "./trading-math";
+import { KalshiClient } from "../kalshi/KalshiClient";
+import { parseDollars, type KalshiMarket } from "../kalshi/types";
 
 // ─── CLI parsing ───────────────────────────────────────────────────────
 
@@ -550,21 +552,87 @@ function placeTrade(sig: Signal): void {
 // ─── Price updates (on every tick) ─────────────────────────────────────
 
 /**
- * Refresh current prices for all open positions. In LIVE mode this is
- * where you'd call KalshiClient.getMarket() — for MVP and tests we use
- * the same Brownian bridge as BACKTEST but driven by wall time. The
- * price poll is rate-limited to PRICE_POLL_MIN so we're not recomputing
- * every 200ms.
+ * Refresh current prices for all open positions.
+ *
+ * LIVE mode polls the real Kalshi `/markets?tickers=…` endpoint so the
+ * dashboard's "current price" / "in-the-money" / "unrealized P&L" fields
+ * reflect actual market state — not the old Brownian-bridge fiction.
+ * BACKTEST mode (and any fetch failure in LIVE) falls back to
+ * `accelPrice()` + the pre-drawn outcome so we stay usable offline and in
+ * tests.
+ *
+ * Live polling is gated on `livePollingEnabled`, which only `start()`
+ * flips on. That keeps the test suite (which imports the module but
+ * doesn't call `start()`) from making real HTTP calls.
+ *
+ * Still-fiction (see LOSS_DIAGNOSIS §90/10): the final WIN/LOSS at
+ * settlement still reads `pos.outcomeWin`, a pre-drawn Bernoulli.
+ * Fixing that requires `KalshiClient.getMarketResult()` — scheduled
+ * next PR (SIGNAL_IMPROVEMENTS item 1.1).
  */
 let lastPricePollMs = 0;
-function refreshPrices(): void {
-  if (state.openPositions.length === 0) return;
-  const pollIntervalMs = Math.max(1, PRICE_POLL_MIN) * 60 * 1000;
-  // BACKTEST: use sim clock. LIVE: use wall clock.
-  const nowForPoll = state.mode === "LIVE" ? Date.now() : state.simNowMs;
-  if (nowForPoll - lastPricePollMs < pollIntervalMs) return;
-  lastPricePollMs = nowForPoll;
+let livePollingEnabled = false;
+let livePollInflight = false;
+let liveClient: KalshiClient | null = null;
+let liveFetchFailures = 0;
+const LIVE_FETCH_TIMEOUT_MS = 4_000;
+const LIVE_FETCH_MAX_FAILURES_BEFORE_WARN = 3;
 
+/** Lazy singleton — mirrors KalshiWeatherFinder's `getClient()` pattern. */
+function getLiveClient(): KalshiClient {
+  if (!liveClient) {
+    liveClient = new KalshiClient({ demo: false, timeout: LIVE_FETCH_TIMEOUT_MS });
+  }
+  return liveClient;
+}
+
+/**
+ * Compute an honest market price from a Kalshi market snapshot.
+ *   - Prefer midpoint of (yes_bid, yes_ask) when both are non-zero
+ *   - Else fall back to last_price
+ *   - Else null (leave the position's currentPrice unchanged)
+ * For NO positions, mirror around 1.0 (since YES + NO ≈ 1 on a binary
+ * market, modulo the spread).
+ */
+function priceFromMarket(m: KalshiMarket, direction: "YES" | "NO"): number | null {
+  const yesBid = parseDollars(m.yes_bid_dollars);
+  const yesAsk = parseDollars(m.yes_ask_dollars);
+  const last = parseDollars(m.last_price_dollars);
+
+  let yesPrice: number | null = null;
+  if (yesBid > 0 && yesAsk > 0 && yesAsk >= yesBid) {
+    yesPrice = (yesBid + yesAsk) / 2;
+  } else if (yesAsk > 0) {
+    yesPrice = yesAsk;
+  } else if (yesBid > 0) {
+    yesPrice = yesBid;
+  } else if (last > 0 && last < 1) {
+    yesPrice = last;
+  }
+
+  if (yesPrice === null) return null;
+
+  // Clamp into (0, 1) — Kalshi can briefly report 0 or 1 during settlement.
+  const clamped = Math.max(0.01, Math.min(0.99, yesPrice));
+  return direction === "YES" ? clamped : 1 - clamped;
+}
+
+/** Apply a new price to a position (shared by LIVE and Brownian paths). */
+function applyPriceUpdate(pos: Position, newPrice: number): void {
+  pos.currentPrice = round2(newPrice);
+  pos.unrealizedPnl = unrealizedPnl(pos.contracts, pos.entryPrice, pos.currentPrice);
+  pos.status = isInTheMoney(pos.entryPrice, pos.currentPrice)
+    ? "IN_THE_MONEY"
+    : pos.currentPrice < pos.entryPrice
+    ? "OUT_OF_MONEY"
+    : "OPEN";
+}
+
+/**
+ * Brownian-bridge fallback. Used by BACKTEST mode always, and by LIVE
+ * mode as a fallback when the HTTP fetch errors out.
+ */
+function refreshPricesBrownian(): void {
   for (const pos of state.openPositions) {
     const t = state.simNowMs;
     const price = accelPrice(
@@ -575,14 +643,88 @@ function refreshPrices(): void {
       pos.outcomeWin,
       { seed: pos.rngSeed, rng: seededUniform },
     );
-    pos.currentPrice = round2(price);
-    pos.unrealizedPnl = unrealizedPnl(pos.contracts, pos.entryPrice, pos.currentPrice);
-    pos.status = isInTheMoney(pos.entryPrice, pos.currentPrice)
-      ? "IN_THE_MONEY"
-      : pos.currentPrice < pos.entryPrice
-      ? "OUT_OF_MONEY"
-      : "OPEN";
+    applyPriceUpdate(pos, price);
   }
+}
+
+/**
+ * LIVE path. Batches all open-position tickers into one
+ * `/markets?tickers=…` call. Non-blocking — the tick loop runs every
+ * 500ms and doesn't wait on this.
+ */
+async function refreshPricesLive(): Promise<void> {
+  if (livePollInflight) return; // don't stack up pending fetches
+  const positions = state.openPositions.slice(); // snapshot
+  if (positions.length === 0) return;
+
+  livePollInflight = true;
+  try {
+    const tickers = Array.from(new Set(positions.map((p) => p.marketTicker))).join(",");
+    const client = getLiveClient();
+    const res = await client.getMarkets({ tickers, limit: Math.max(20, positions.length) });
+    const byTicker = new Map<string, KalshiMarket>();
+    for (const m of res.markets ?? []) byTicker.set(m.ticker, m);
+
+    const stalePositions: Position[] = [];
+    for (const pos of state.openPositions) {
+      const market = byTicker.get(pos.marketTicker);
+      if (!market) {
+        stalePositions.push(pos);
+        continue;
+      }
+      const price = priceFromMarket(market, pos.direction);
+      if (price === null) {
+        stalePositions.push(pos);
+        continue;
+      }
+      applyPriceUpdate(pos, price);
+    }
+
+    // For any ticker Kalshi didn't return or returned empty book, keep the
+    // dashboard alive with a Brownian estimate — rather than a frozen price
+    // that misleads for hours.
+    for (const pos of stalePositions) {
+      const t = state.simNowMs;
+      const price = accelPrice(
+        t, pos.placedAtMs, pos.resolvesAtMs, pos.entryPrice, pos.outcomeWin,
+        { seed: pos.rngSeed, rng: seededUniform },
+      );
+      applyPriceUpdate(pos, price);
+    }
+
+    liveFetchFailures = 0;
+    recomputePortfolio();
+  } catch (err) {
+    liveFetchFailures += 1;
+    if (liveFetchFailures === 1 || liveFetchFailures % LIVE_FETCH_MAX_FAILURES_BEFORE_WARN === 0) {
+      console.warn(
+        `  [live-poll] Kalshi fetch failed (${liveFetchFailures} consecutive): ` +
+          `${(err as Error).message}. Falling back to Brownian bridge for this tick.`,
+      );
+    }
+    // Fallback so the dashboard still moves — same behavior as before.
+    refreshPricesBrownian();
+  } finally {
+    livePollInflight = false;
+  }
+}
+
+function refreshPrices(): void {
+  if (state.openPositions.length === 0) return;
+  const pollIntervalMs = Math.max(1, PRICE_POLL_MIN) * 60 * 1000;
+  // BACKTEST: use sim clock. LIVE: use wall clock.
+  const nowForPoll = state.mode === "LIVE" ? Date.now() : state.simNowMs;
+  if (nowForPoll - lastPricePollMs < pollIntervalMs) return;
+  lastPricePollMs = nowForPoll;
+
+  if (state.mode === "LIVE" && livePollingEnabled) {
+    // Fire-and-forget. The `livePollInflight` guard keeps us from
+    // stacking pending fetches if the API is slow.
+    void refreshPricesLive();
+    return;
+  }
+
+  refreshPricesBrownian();
 }
 
 // ─── Resolution ────────────────────────────────────────────────────────
@@ -731,6 +873,14 @@ function statusLine(): void {
 
 function start(): void {
   banner();
+
+  // Enable real Kalshi price polling for the LIVE trader. Tests import
+  // this module without calling start(), so they never flip this flag
+  // and never fire HTTP — keeps the test suite offline-safe.
+  if (MODE === "LIVE") {
+    livePollingEnabled = true;
+    console.log("  [live-poll] Real Kalshi market polling: ENABLED (production API).\n");
+  }
 
   // Skip signals that were already in the file when we started (they're stale)
   if (existsSync(JSONL_PATH)) {

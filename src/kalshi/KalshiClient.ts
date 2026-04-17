@@ -181,6 +181,23 @@ export class KalshiClient {
   }
 
   /**
+   * Get a single market by ticker. Uses the `tickers` filter on the public
+   * markets endpoint — no auth required. Returns null if the market isn't
+   * found (covers both 404s and empty `markets[]` responses).
+   *
+   * This is the hook the paper-trader uses to keep "current price" honest in
+   * LIVE mode. Prefer the midpoint of (yes_bid, yes_ask); fall back to
+   * last_price when the book is one-sided. See paper-trader.ts:refreshPrices.
+   */
+  async getMarket(ticker: string): Promise<KalshiMarket | null> {
+    const res = await this.request<GetMarketsResponse>(
+      "GET",
+      `/markets?tickers=${encodeURIComponent(ticker)}`,
+    );
+    return res.markets?.[0] ?? null;
+  }
+
+  /**
    * Get a single market's order book.
    * Note: requires auth on Kalshi.
    */
