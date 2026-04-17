@@ -15,29 +15,32 @@
  */
 
 import { fetchWithRetry } from "../net/fetchWithRetry";
+import { fetchGFSEnsemble } from "./GFSEnsemble";
 
-// City coordinates — covers both Polymarket (international) and Kalshi (US) cities
+// City coordinates — US cities use NWS Daily Climate Report station (airport ASOS),
+// NOT city center, because Kalshi resolves against that station's reading.
+// International cities keep city center coords (Polymarket resolution varies).
 const CITY_COORDS: Record<string, { lat: number; lon: number; country: "US" | "INT" }> = {
-  // US cities (Kalshi + Polymarket)
-  "new york city": { lat: 40.7128, lon: -74.0060, country: "US" },
-  "nyc": { lat: 40.7128, lon: -74.0060, country: "US" },
-  "chicago": { lat: 41.8781, lon: -87.6298, country: "US" },
-  "miami": { lat: 25.7617, lon: -80.1918, country: "US" },
-  "los angeles": { lat: 34.0522, lon: -118.2437, country: "US" },
-  "austin": { lat: 30.2672, lon: -97.7431, country: "US" },
-  "denver": { lat: 39.7392, lon: -104.9903, country: "US" },
-  "atlanta": { lat: 33.7490, lon: -84.3880, country: "US" },
-  "dallas": { lat: 32.7767, lon: -96.7970, country: "US" },
-  "seattle": { lat: 47.6062, lon: -122.3321, country: "US" },
-  "houston": { lat: 29.7604, lon: -95.3698, country: "US" },
-  "phoenix": { lat: 33.4484, lon: -112.0740, country: "US" },
-  "boston": { lat: 42.3601, lon: -71.0589, country: "US" },
-  "las vegas": { lat: 36.1699, lon: -115.1398, country: "US" },
-  "minneapolis": { lat: 44.9778, lon: -93.2650, country: "US" },
-  "philadelphia": { lat: 39.9526, lon: -75.1652, country: "US" },
-  "san francisco": { lat: 37.7749, lon: -122.4194, country: "US" },
-  "san antonio": { lat: 29.4241, lon: -98.4936, country: "US" },
-  "washington dc": { lat: 38.9072, lon: -77.0369, country: "US" },
+  // US cities — airport/NWS CLI station coords (Kalshi + Polymarket)
+  "new york city": { lat: 40.7790, lon: -73.9692, country: "US" },  // Central Park (KNYC)
+  "nyc":           { lat: 40.7790, lon: -73.9692, country: "US" },  // Central Park (KNYC)
+  "chicago":       { lat: 41.7860, lon: -87.7524, country: "US" },  // Midway (KMDW)
+  "miami":         { lat: 25.7933, lon: -80.2906, country: "US" },  // MIA (KMIA)
+  "los angeles":   { lat: 33.9425, lon: -118.4081, country: "US" }, // LAX (KLAX)
+  "austin":        { lat: 30.1945, lon: -97.6699, country: "US" },  // Bergstrom (KAUS)
+  "denver":        { lat: 39.8617, lon: -104.6732, country: "US" }, // DIA (KDEN)
+  "atlanta":       { lat: 33.6367, lon: -84.4281, country: "US" },  // Hartsfield (KATL)
+  "dallas":        { lat: 32.8968, lon: -97.0380, country: "US" },  // DFW (KDFW)
+  "seattle":       { lat: 47.4490, lon: -122.3093, country: "US" }, // Sea-Tac (KSEA)
+  "houston":       { lat: 29.6454, lon: -95.2789, country: "US" },  // Hobby (KHOU)
+  "phoenix":       { lat: 33.4343, lon: -112.0117, country: "US" }, // Sky Harbor (KPHX)
+  "boston":         { lat: 42.3631, lon: -71.0064, country: "US" },  // Logan (KBOS)
+  "las vegas":     { lat: 36.0803, lon: -115.1524, country: "US" }, // Reid (KLAS)
+  "minneapolis":   { lat: 44.8820, lon: -93.2218, country: "US" },  // MSP (KMSP)
+  "philadelphia":  { lat: 39.8721, lon: -75.2407, country: "US" },  // PHL (KPHL)
+  "san francisco": { lat: 37.6188, lon: -122.3754, country: "US" }, // SFO (KSFO)
+  "san antonio":   { lat: 29.5340, lon: -98.4691, country: "US" },  // SAT (KSAT)
+  "washington dc": { lat: 38.8514, lon: -77.0377, country: "US" },  // Reagan (KDCA)
   // International cities (Polymarket)
   "london": { lat: 51.5074, lon: -0.1278, country: "INT" },
   "paris": { lat: 48.8566, lon: 2.3522, country: "INT" },
@@ -75,6 +78,13 @@ export interface EnsembleDayForecast {
   spreadHighF: number;    // std dev across models (disagreement)
   spreadLowF: number;
   modelCount: number;
+  /**
+   * GFS 31-member ensemble distribution (°F) when available. When present,
+   * bracket probability is computed empirically by counting members in the
+   * bracket instead of from a Gaussian approximation — captures fat tails.
+   */
+  highFMembers?: number[];
+  lowFMembers?: number[];
 }
 
 export interface EnsembleForecast {
@@ -93,7 +103,10 @@ async function fetchOpenMeteoModel(
   days: number,
 ): Promise<{ date: string; highC: number; lowC: number }[] | null> {
   try {
-    const url = `${modelUrl}?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=${Math.min(days + 1, 16)}`;
+    // ECMWF bias_correction uses nearby station observations to post-process raw NWP,
+    // reducing systematic errors — especially valuable when all models share NWP heritage
+    const biasParam = modelName === "ecmwf" ? "&bias_correction=true" : "";
+    const url = `${modelUrl}?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=${Math.min(days + 1, 16)}${biasParam}`;
     const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000 });
     const data = await res.json();
     if (!data.daily) return null;
@@ -195,7 +208,21 @@ export async function fetchEnsembleForecast(
     );
   }
 
-  const results = await Promise.all(modelFetches);
+  // Also fetch GFS 31-member ensemble in parallel (for empirical prob calc)
+  const gfsMembersPromise = fetchGFSEnsemble(city, daysAhead);
+
+  const [results, gfsEnsemble] = await Promise.all([
+    Promise.all(modelFetches),
+    gfsMembersPromise,
+  ]);
+
+  // Build a lookup: date → { highFMembers, lowFMembers }
+  const gfsMembersByDate = new Map<string, { highs: number[]; lows: number[] }>();
+  if (gfsEnsemble) {
+    for (const d of gfsEnsemble.days) {
+      gfsMembersByDate.set(d.date, { highs: d.highF_members, lows: d.lowF_members });
+    }
+  }
 
   // Collect all dates across models
   const allDates = new Set<string>();
@@ -245,6 +272,7 @@ export async function fetchEnsembleForecast(
       ? Math.sqrt(lowsF.reduce((s, l) => s + (l - meanLowF) ** 2, 0) / lowsF.length)
       : 0;
 
+    const gfsForDate = gfsMembersByDate.get(date);
     forecasts.push({
       date,
       models,
@@ -255,6 +283,8 @@ export async function fetchEnsembleForecast(
       spreadHighF: Math.round(spreadHighF * 10) / 10,
       spreadLowF: Math.round(spreadLowF * 10) / 10,
       modelCount: models.length,
+      highFMembers: gfsForDate?.highs,
+      lowFMembers: gfsForDate?.lows,
     });
   }
 
@@ -278,7 +308,25 @@ export function ensembleBracketProbability(
   bracketLowF: number,
   bracketHighF: number,
   hoursUntilResolution: number,
+  /** Optional: GFS 31-member distribution. When provided with ≥10 members,
+   *  computes empirical probability (count in bracket / total) instead of
+   *  Gaussian — captures fat tails, bimodality, and skew. */
+  members?: number[],
 ): number {
+  // Empirical path: count members in bracket with continuity correction.
+  // Laplace smoothing (α=0.5) prevents 0%/100% for narrow brackets.
+  if (members && members.length >= 10) {
+    const loCut = (bracketLowF != null && isFinite(bracketLowF)) ? bracketLowF - 0.5 : -Infinity;
+    const hiCut = (bracketHighF != null && isFinite(bracketHighF)) ? bracketHighF + 0.5 : Infinity;
+    let count = 0;
+    for (const m of members) {
+      if (m >= loCut && m <= hiCut) count++;
+    }
+    const alpha = 0.5;
+    return (count + alpha) / (members.length + 2 * alpha);
+  }
+
+  // Gaussian fallback
   // Base sigma from forecast horizon
   const baseSigma = hoursUntilResolution <= 12 ? 1.5
     : hoursUntilResolution <= 24 ? 2.0

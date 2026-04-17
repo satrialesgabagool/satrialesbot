@@ -38,6 +38,9 @@ const MAX_SPREAD = argVal("--max-spread", 4.0);
 const INSTANT_RESOLVE = args.includes("--instant");
 const FRESH_START = args.includes("--fresh");
 const RESUME = !FRESH_START;
+const SNIPE_ENABLED = !args.includes("--no-snipe"); // snipe on by default for Kalshi
+const SNIPE_MAX_PRICE = argVal("--snipe-max-price", 0.92);
+const SNIPE_BUDGET = argVal("--snipe-budget", 25);
 
 // ─── ANSI helpers ────────────────────────────────────────────────────
 const c = {
@@ -102,7 +105,11 @@ ${c.blue}${c.bold}  ╔═══════════════════
   ${c.dim}Models:${c.reset}            Open-Meteo + ECMWF + GFS + NOAA
   ${c.dim}Max model spread:${c.reset}  ±${MAX_SPREAD.toFixed(0)}°F
   ${c.dim}Min bracket:${c.reset}       $0.03 (skip penny brackets)
-  ${c.dim}Sizing:${c.reset}            Edge-weighted, mild bonus on cheap brackets
+  ${c.dim}Max tail σ:${c.reset}        1.0 (skip brackets far from forecast)
+  ${c.dim}Sizing:${c.reset}            Pure edge-weighted (cheap bonus removed)
+  ${c.dim}Fees:${c.reset}              Kalshi 7% on net winnings
+  ${c.dim}GFS ensemble:${c.reset}      31-member empirical (when available)
+  ${c.dim}Snipe mode:${c.reset}        ${SNIPE_ENABLED ? `ON (METAR lock, max $${SNIPE_MAX_PRICE.toFixed(2)}, $${SNIPE_BUDGET} budget)` : "OFF"}
   ${c.dim}Resolution:${c.reset}        ${INSTANT_RESOLVE ? "Instant (needs past dates)" : "NWS Daily Climate Report (sim: Open-Meteo archive)"}
   ${c.dim}State:${c.reset}             ${FRESH_START ? "Fresh start" : WeatherSimulator.hasSavedState() ? "Resuming from saved state" : "New session"}
   ${c.dim}State file:${c.reset}        state/weather-sim.json
@@ -248,8 +255,14 @@ async function main() {
     maxModelSpreadF: MAX_SPREAD,
     minBracketPrice: 0.03,    // skip $0.01-$0.02 penny brackets (no real liquidity)
     minYesBid: 0,             // Kalshi penny markets have no bids — rely on price filter
+    maxTailSigma: 1.0,        // skip brackets where forecast is >1σ outside the bracket
     marketFinder: kalshiFinder,
     exchange: "kalshi",
+    // Snipe mode — buy the winning bracket after actual temp is observed
+    snipeEnabled: SNIPE_ENABLED,
+    snipeMaxPrice: SNIPE_MAX_PRICE,
+    snipeBudget: SNIPE_BUDGET,
+    snipeMinConfidence: "likely_final",
   }, RESUME);
 
   sim.onLog = logLine;

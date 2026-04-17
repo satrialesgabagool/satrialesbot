@@ -13,6 +13,9 @@
 
 import { findWeatherMarkets, type WeatherMarket, type TempBracket } from "./WeatherMarketFinder";
 import { fetchEnsembleForecast, ensembleBracketProbability, type EnsembleForecast } from "./WeatherEnsemble";
+import { fetchObservedHigh, findWinningBracket, type ObservedTemp } from "./WeatherObserver";
+import { detectSameDayLock, lockedBracketProbability, type METARLockResult } from "./METARObserver";
+import { kalshiFee } from "./KalshiFees";
 import { fetchWithRetry } from "../net/fetchWithRetry";
 import { appendFileSync, existsSync, writeFileSync, readFileSync, renameSync, mkdirSync } from "fs";
 import { join } from "path";
@@ -24,24 +27,40 @@ export type MarketFinderFn = (options?: {
 }) => Promise<WeatherMarket[]>;
 
 // City coordinates for archive API lookups
+// US cities use NWS CLI station (airport ASOS) — matches resolution source
 const CITY_COORDS: Record<string, [number, number]> = {
-  "new york city": [40.7128, -74.0060],
-  "atlanta": [33.7490, -84.3880],
-  "dallas": [32.7767, -96.7970],
-  "seattle": [47.6062, -122.3321],
-  "london": [51.5074, -0.1278],
-  "paris": [48.8566, 2.3522],
-  "tokyo": [35.6762, 139.6503],
-  "seoul": [37.5665, 126.9780],
-  "beijing": [39.9042, 116.4074],
-  "shanghai": [31.2304, 121.4737],
-  "hong kong": [22.3193, 114.1694],
-  "taipei": [25.0330, 121.5654],
-  "toronto": [43.6532, -79.3832],
+  "new york city": [40.7790, -73.9692],  // Central Park (KNYC)
+  "atlanta":       [33.6367, -84.4281],  // Hartsfield (KATL)
+  "dallas":        [32.8968, -97.0380],  // DFW (KDFW)
+  "seattle":       [47.4490, -122.3093], // Sea-Tac (KSEA)
+  "chicago":       [41.7860, -87.7524],  // Midway (KMDW)
+  "miami":         [25.7933, -80.2906],  // MIA (KMIA)
+  "los angeles":   [33.9425, -118.4081], // LAX (KLAX)
+  "austin":        [30.1945, -97.6699],  // Bergstrom (KAUS)
+  "denver":        [39.8617, -104.6732], // DIA (KDEN)
+  "houston":       [29.6454, -95.2789],  // Hobby (KHOU)
+  "phoenix":       [33.4343, -112.0117], // Sky Harbor (KPHX)
+  "boston":         [42.3631, -71.0064],  // Logan (KBOS)
+  "las vegas":     [36.0803, -115.1524], // Reid (KLAS)
+  "minneapolis":   [44.8820, -93.2218],  // MSP (KMSP)
+  "philadelphia":  [39.8721, -75.2407],  // PHL (KPHL)
+  "san francisco": [37.6188, -122.3754], // SFO (KSFO)
+  "san antonio":   [29.5340, -98.4691],  // SAT (KSAT)
+  "washington dc": [38.8514, -77.0377],  // Reagan (KDCA)
+  // International cities (Polymarket) — city center coords
+  "london":      [51.5074, -0.1278],
+  "paris":       [48.8566, 2.3522],
+  "tokyo":       [35.6762, 139.6503],
+  "seoul":       [37.5665, 126.9780],
+  "beijing":     [39.9042, 116.4074],
+  "shanghai":    [31.2304, 121.4737],
+  "hong kong":   [22.3193, 114.1694],
+  "taipei":      [25.0330, 121.5654],
+  "toronto":     [43.6532, -79.3832],
   "mexico city": [19.4326, -99.1332],
-  "madrid": [40.4168, -3.7038],
-  "ankara": [39.9334, 32.8597],
-  "wellington": [-41.2865, 174.7762],
+  "madrid":      [40.4168, -3.7038],
+  "ankara":      [39.9334, 32.8597],
+  "wellington":  [-41.2865, 174.7762],
 };
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -82,10 +101,22 @@ export interface SimulatorConfig {
   minBracketPrice: number;
   /** Minimum yes_bid required (ensures there's a real buyer — 0 means no ask) */
   minYesBid: number;
+  /** Maximum bracket distance from forecast in sigmas — skips unreliable tail bets */
+  maxTailSigma: number;
   /** Custom market finder function — defaults to Polymarket's findWeatherMarkets */
   marketFinder?: MarketFinderFn;
   /** Exchange label for display/logging */
   exchange?: "polymarket" | "kalshi";
+
+  // ─── Snipe mode ─────────────────────────────────────────────────
+  /** Enable late-day sniping — buy the winning bracket after actual temp is observed */
+  snipeEnabled: boolean;
+  /** Max price to pay for the winning bracket (e.g., 0.92 = need ≥8% edge) */
+  snipeMaxPrice: number;
+  /** Budget per snipe (single bracket, not a ladder) */
+  snipeBudget: number;
+  /** Minimum confidence level to fire: "partial" | "likely_final" | "final" */
+  snipeMinConfidence: "partial" | "likely_final" | "final";
 }
 
 export interface SimulatorState {
@@ -108,11 +139,17 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   scanIntervalMs: 5 * 60 * 1000,
   daysAhead: 3,
   resolveWithNoise: true,
-  cheapBracketBonus: true,
+  cheapBracketBonus: false,  // deprecated — sizing is now pure edge-weighted
   maxModelSpreadF: 4.0,    // skip when models disagree by >4°F
   minBracketPrice: 0.03,   // skip $0.01-$0.02 brackets (no real liquidity)
   minYesBid: 0,            // 0 = don't filter by bid (Kalshi penny markets have no bids)
+  maxTailSigma: 1.0,       // skip brackets where forecast is >1σ outside the bracket
   exchange: "polymarket",
+  // Snipe defaults (disabled by default — enable for Kalshi)
+  snipeEnabled: false,
+  snipeMaxPrice: 0.92,     // max 92¢ for the winner = min 8% return
+  snipeBudget: 25,         // $25 per snipe (single winning bracket)
+  snipeMinConfidence: "likely_final",
 };
 
 const RESULTS_DIR = join(import.meta.dir, "../../results");
@@ -324,8 +361,12 @@ export class WeatherSimulator {
   // ─── Helpers ─────────────────────────────────────────────────────
 
   bracketLabel(b: TempBracket): string {
-    if (!isFinite(b.lowF) && isFinite(b.highF)) return `≤${b.highF}°F`;
-    if (isFinite(b.lowF) && !isFinite(b.highF)) return `≥${b.lowF}°F`;
+    // Use nullish/finite check — isFinite(null) returns true in JS (null → 0),
+    // so we need an explicit null/undefined check for tail brackets restored from state
+    const hasLow = b.lowF != null && isFinite(b.lowF);
+    const hasHigh = b.highF != null && isFinite(b.highF);
+    if (!hasLow && hasHigh) return `≤${b.highF}°F`;
+    if (hasLow && !hasHigh) return `≥${b.lowF}°F`;
     return `${b.lowF}-${b.highF}°F`;
   }
 
@@ -350,16 +391,13 @@ export class WeatherSimulator {
     candidates: Array<{ bracket: TempBracket; prob: number; edge: number }>,
     totalBudget: number,
   ): Array<{ bracket: TempBracket; prob: number; edge: number; allocation: number }> {
-    // Weight = edge × cheapness multiplier
+    // Weight = edge only. The cheap bracket bonus was removed after live sim
+    // showed it amplified sizing on overpriced tail bets (our Gaussian model
+    // overstates tail probabilities, and cheap brackets ARE the tails).
+    // Size is now proportional to edge — confidence translates directly to $.
     let totalWeight = 0;
     const weighted = candidates.map(c => {
-      const price = c.bracket.outcomePrices[0];
-      // Mild bonus for cheaper brackets — reduced from 2.0/1.5 to 1.3/1.15
-      // after live sim showed penny brackets had phantom liquidity and amplified losses
-      const cheapBonus = this.config.cheapBracketBonus && price <= 0.10 ? 1.3
-        : this.config.cheapBracketBonus && price <= 0.20 ? 1.15
-        : 1.0;
-      const weight = c.edge * cheapBonus;
+      const weight = c.edge;
       totalWeight += weight;
       return { ...c, weight };
     });
@@ -378,15 +416,18 @@ export class WeatherSimulator {
 
   async start() {
     this.running = true;
-    this.log("Weather simulator v2 started (ladder strategy + ensemble forecasts)", "cyan");
+    const snipeTag = this.config.snipeEnabled ? " + snipe mode" : "";
+    this.log(`Weather simulator v2 started (ladder strategy + ensemble forecasts${snipeTag})`, "cyan");
 
     // Initial scan
     await this.scanAndTrade();
+    if (this.config.snipeEnabled) await this.scanForSnipes();
 
     // Periodic scan
     this.scanTimer = setInterval(async () => {
       if (!this.running) return;
       await this.scanAndTrade();
+      if (this.config.snipeEnabled) await this.scanForSnipes();
     }, this.config.scanIntervalMs);
   }
 
@@ -495,9 +536,15 @@ export class WeatherSimulator {
       // Evaluate ALL brackets for edge
       const candidates: Array<{ bracket: TempBracket; prob: number; edge: number }> = [];
 
+      // GFS 31-member distribution for this day/side (if available).
+      // When present, ensembleBracketProbability uses empirical counting.
+      const members = market.type === "high"
+        ? dayForecast.highFMembers
+        : dayForecast.lowFMembers;
+
       for (const bracket of market.brackets) {
         const prob = ensembleBracketProbability(
-          forecastTempF, spreadF, bracket.lowF, bracket.highF, hoursToRes
+          forecastTempF, spreadF, bracket.lowF, bracket.highF, hoursToRes, members
         );
         const marketPrice = bracket.outcomePrices[0];
 
@@ -512,6 +559,27 @@ export class WeatherSimulator {
         // Optional bid-side filter: if the bracket has _yesBid data, check it
         const yesBid = (bracket as any)._yesBid;
         if (this.config.minYesBid > 0 && typeof yesBid === "number" && yesBid < this.config.minYesBid) continue;
+
+        // Tail-bracket filter: skip brackets whose nearest edge is more than
+        // maxTailSigma σ AWAY from the forecast (i.e. forecast is outside the
+        // bracket by a large margin). Our Gaussian overstates tail probs because
+        // real weather errors are fatter-body/thinner-tail than N(μ,σ), and our
+        // σ is model agreement (too narrow). This blocks "hope" bets on distant
+        // brackets — NOT covering bets where forecast is inside the bracket.
+        const effSigma = Math.max(1.5, Math.sqrt(
+          (hoursToRes <= 12 ? 1.5 : hoursToRes <= 24 ? 2.0 : hoursToRes <= 48 ? 3.0 : hoursToRes <= 72 ? 4.0 : 5.0) ** 2
+          + spreadF ** 2
+        ));
+        const bLow = (bracket.lowF != null && isFinite(bracket.lowF)) ? bracket.lowF : -Infinity;
+        const bHigh = (bracket.highF != null && isFinite(bracket.highF)) ? bracket.highF : Infinity;
+        // Distance from forecast to the nearest bracket edge, signed:
+        // negative/zero if forecast is INSIDE the bracket (distance = 0)
+        // positive if forecast is OUTSIDE the bracket (distance to near edge)
+        let distAway = 0;
+        if (forecastTempF < bLow) distAway = bLow - forecastTempF;
+        else if (forecastTempF > bHigh) distAway = forecastTempF - bHigh;
+        const distSigmas = distAway / effSigma;
+        if (distSigmas > this.config.maxTailSigma) continue;
 
         const edge = prob - marketPrice;
         if (edge >= this.config.minEdge) {
@@ -606,6 +674,177 @@ export class WeatherSimulator {
     this.saveState();
     this.onScanComplete?.(opportunitiesFound);
     this.onDashboardUpdate?.();
+  }
+
+  // ─── Snipe Mode ────────────────────────────────────────────────
+  //
+  // After the daily high is recorded (typically by 5-6pm local), the
+  // outcome of the KXHIGH market is effectively known — but the market
+  // stays open until ~1am ET. If the winning bracket's ask is stale
+  // (still below $0.92), buy it for a near-guaranteed return.
+
+  /** Set of snipe keys we've already fired — prevents duplicate snipes */
+  private snipedKeys = new Set<string>();
+
+  async scanForSnipes() {
+    if (!this.config.snipeEnabled) return;
+
+    this.log("Snipe scan — checking observed temps...", "magenta");
+
+    // 1. Find markets closing soon
+    const finder = this.config.marketFinder ?? findWeatherMarkets;
+    let markets: WeatherMarket[];
+    try {
+      markets = await finder({ daysAhead: 1 }); // only today + tomorrow
+    } catch (err) {
+      this.log(`Snipe scan failed to fetch markets: ${err}`, "red");
+      return;
+    }
+
+    // Filter to high markets closing within 12 hours (daily high is locked
+    // by ~5-6pm local, markets close ~1am ET next day = up to ~12h window).
+    // We use time-to-close, NOT date comparison — a market's "date" refers
+    // to the weather day, but at 10pm ET the UTC date is already next day.
+    const now = Date.now();
+    const MAX_HOURS_TO_CLOSE = 12;
+    const snipeMarkets = markets.filter(m => {
+      if (m.type !== "high") return false;
+      const hoursToClose = (new Date(m.endDate).getTime() - now) / (1000 * 60 * 60);
+      return hoursToClose > 0 && hoursToClose <= MAX_HOURS_TO_CLOSE;
+    });
+
+    if (snipeMarkets.length === 0) {
+      this.log("Snipe: no markets closing in next 12h", "dim");
+      return;
+    }
+
+    this.log(`Snipe: ${snipeMarkets.length} markets closing in next 12h`, "dim");
+
+    // 2. Fetch observed highs for each city
+    let snipesFound = 0;
+
+    for (const market of snipeMarkets) {
+      const snipeKey = `snipe-${market.city.toLowerCase()}-${market.date}`;
+
+      // Already sniped this market
+      if (this.snipedKeys.has(snipeKey)) continue;
+      // Note: we INTENTIONALLY do NOT skip markets with existing ladder legs.
+      // The ladder bets were forecast-based and may pick the wrong bracket;
+      // the snipe is based on actual observed temp. If they target different
+      // brackets, that's fine — the snipe is a separate, higher-confidence trade.
+
+      // Fetch METAR lock (three-condition: peak age ≥2h AND drop ≥1.5°F AND local hour ≥15)
+      const lock = await detectSameDayLock(market.city, market.date);
+      if (!lock) {
+        this.log(`Snipe ${market.city}: no METAR data`, "dim");
+        continue;
+      }
+      if (!lock.locked) {
+        this.log(
+          `Snipe ${market.city}: peak=${lock.peakTempF}°F @ ${lock.station} — ${lock.reason}`,
+          "dim"
+        );
+        continue;
+      }
+
+      // 3. Find winning bracket using the locked peak (rounded to integer like NWS)
+      const peakRounded = Math.round(lock.peakTempF);
+      const winIdx = findWinningBracket(peakRounded, market.brackets);
+      if (winIdx < 0) {
+        this.log(
+          `Snipe ${market.city}: locked peak=${lock.peakTempF}°F (rounded ${peakRounded}) doesn't match any bracket`,
+          "yellow"
+        );
+        continue;
+      }
+
+      const winBracket = market.brackets[winIdx];
+      const winPrice = winBracket.outcomePrices[0]; // yes_ask
+
+      // 4. Check if the price is stale enough to snipe
+      if (winPrice > this.config.snipeMaxPrice) {
+        this.log(
+          `Snipe ${market.city}: winner ${this.bracketLabel(winBracket)} ` +
+          `@ $${winPrice.toFixed(2)} — too expensive (max $${this.config.snipeMaxPrice.toFixed(2)})`,
+          "dim"
+        );
+        continue;
+      }
+
+      if (winPrice < 0.40) {
+        // Market disagrees strongly — observed temp might not be final
+        this.log(
+          `Snipe ${market.city}: winner ${this.bracketLabel(winBracket)} ` +
+          `@ $${winPrice.toFixed(2)} — market disagrees, skipping`,
+          "yellow"
+        );
+        continue;
+      }
+
+      // 5. Size the snipe — single bracket, not a ladder
+      const budget = Math.min(
+        this.config.snipeBudget,
+        this.state.balance - this.state.deployed
+      );
+      if (budget < 2) continue;
+
+      const shares = Math.floor(budget / winPrice);
+      if (shares < 1) continue;
+      const cost = shares * winPrice;
+
+      const expectedReturn = (shares * 1.0) - cost;
+      const returnPct = ((1.0 / winPrice) - 1) * 100;
+
+      // Ensure enough balance
+      if (cost > this.state.balance - this.state.deployed) continue;
+
+      // 6. Fire the snipe
+      const endDate = new Date(market.endDate);
+      const hoursToRes = Math.max(0, (endDate.getTime() - Date.now()) / (1000 * 60 * 60));
+
+      const pos: WeatherPosition = {
+        id: `SNIPE-${++this.positionCounter}`,
+        market,
+        bracket: winBracket,
+        shares,
+        entryPrice: winPrice,
+        cost,
+        forecastTempF: lock.peakTempF,  // actual METAR-observed peak, not forecast
+        forecastProb: 0.98,             // METAR lock probability (lockedBracketProbability)
+        edge: 0.98 - winPrice,          // true probability − market price
+        modelSpreadF: 0,
+        modelCount: 0,                  // not a model prediction, METAR-locked
+        hoursToResolution: hoursToRes,
+        entryTime: new Date().toISOString(),
+        status: "open",
+        pnl: 0,
+        ladderGroup: `snipe-${market.city}-${market.date}`,
+      };
+
+      // Deploy
+      this.state.positions.push(pos);
+      this.state.deployed += cost;
+      this.snipedKeys.add(snipeKey);
+      this.logTrade("SNIPE", pos);
+      this.onPositionOpened?.(pos);
+      snipesFound++;
+
+      this.log(
+        `🎯 SNIPE ${market.city} ${market.date}: METAR-locked peak=${lock.peakTempF}°F @ ${lock.station} ` +
+        `(${lock.peakAgeHours}h ago) → ${this.bracketLabel(winBracket)} @ $${winPrice.toFixed(2)} ` +
+        `(${shares} shares, $${cost.toFixed(2)} cost, +${returnPct.toFixed(0)}% return, ` +
+        `${hoursToRes.toFixed(1)}h to close)`,
+        "green"
+      );
+    }
+
+    if (snipesFound === 0) {
+      this.log("Snipe: no opportunities found this scan", "dim");
+    } else {
+      this.log(`Snipe: ${snipesFound} snipe(s) fired`, "green");
+      this.saveState();
+      this.onDashboardUpdate?.();
+    }
   }
 
   // ─── Fetch actual recorded temperature ──────────────────────────
@@ -725,17 +964,20 @@ export class WeatherSimulator {
 
       for (const pos of positions) {
         const b = pos.bracket;
-        const inBracket = actualTempF >= (isFinite(b.lowF) ? b.lowF : -Infinity)
-          && actualTempF <= (isFinite(b.highF) ? b.highF : Infinity);
+        const lo = (b.lowF != null && isFinite(b.lowF)) ? b.lowF : -Infinity;
+        const hi = (b.highF != null && isFinite(b.highF)) ? b.highF : Infinity;
+        const inBracket = actualTempF >= lo && actualTempF <= hi;
 
         if (inBracket) {
+          // Kalshi charges 7% on net winnings (payout − stake), losses are fee-free
           const payout = pos.shares * 1.0;
-          pos.pnl = payout - pos.cost;
+          const fee = kalshiFee(pos.shares, pos.entryPrice, true);
+          pos.pnl = payout - pos.cost - fee;
           pos.status = "won";
-          this.state.balance += payout;
+          this.state.balance += payout - fee;
           this.state.wins++;
           this.log(
-            `  WON  ${this.bracketLabel(b)} → ${pos.shares}sh × $1.00 = $${payout.toFixed(2)} (cost $${pos.cost.toFixed(2)}) → +$${pos.pnl.toFixed(2)}`,
+            `  WON  ${this.bracketLabel(b)} → ${pos.shares}sh × $1.00 = $${payout.toFixed(2)} (cost $${pos.cost.toFixed(2)}, fee $${fee.toFixed(2)}) → +$${pos.pnl.toFixed(2)}`,
             "green"
           );
         } else {
