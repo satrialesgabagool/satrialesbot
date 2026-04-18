@@ -67,7 +67,7 @@ export async function fetchForecast(city: string, daysAhead: number = 3): Promis
   try {
     const url = `${OPEN_METEO_API}?latitude=${lat}&longitude=${lon}&hourly=temperature_2m&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=${Math.min(daysAhead + 1, 16)}`;
 
-    const res = await fetchWithRetry(url, { timeout: 10_000 });
+    const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000 });
     const data = await res.json();
 
     if (!data.daily || !data.hourly) return null;

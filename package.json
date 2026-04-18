@@ -4,14 +4,22 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "kalshi": "bun run src/kalshi/cli.ts",
+    "kalshi:weather": "bun run src/kalshi/cli.ts weather",
+    "kalshi:whale": "bun run src/kalshi/cli.ts whale",
+    "kalshi:both": "bun run src/kalshi/cli.ts both",
+    "dashboard": "bun run src/dashboard/server.ts",
+    "paper-trade": "bun run src/dashboard/paper-trader.ts",
+    "demo": "bun run src/dashboard/seed-demo.ts"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^5.8.1",
     "@js-sdsl/ordered-map": "^4.4.2",
+    "@polymarket/clob-client": "^5.8.1",
+    "commander": "^14.0.3",
     "ethers": "^6.16.0",
-    "viem": "^2.47.6",
-    "commander": "^14.0.3"
+    "hono": "^4.12.14",
+    "viem": "^2.47.6"
   },
   "devDependencies": {
     "@types/bun": "latest",

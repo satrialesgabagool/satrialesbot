@@ -15,6 +15,7 @@
  */
 
 import { fetchWithRetry } from "../net/fetchWithRetry";
+import { empiricalBracketProbability } from "./GFSEnsemble";
 
 // City coordinates — covers both Polymarket (international) and Kalshi (US) cities
 const CITY_COORDS: Record<string, { lat: number; lon: number; country: "US" | "INT" }> = {
@@ -94,7 +95,7 @@ async function fetchOpenMeteoModel(
 ): Promise<{ date: string; highC: number; lowC: number }[] | null> {
   try {
     const url = `${modelUrl}?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=${Math.min(days + 1, 16)}`;
-    const res = await fetchWithRetry(url, { timeout: 10_000 });
+    const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000 });
     const data = await res.json();
     if (!data.daily) return null;
 
@@ -114,18 +115,15 @@ async function fetchNOAA(lat: number, lon: number): Promise<{ date: string; high
   try {
     // Step 1: Get the forecast grid
     const pointUrl = `https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`;
-    const pointRes = await fetchWithRetry(pointUrl, {
-      timeout: 10_000,
-    }, { maxRetries: 1 });
+    const pointRes = await fetchWithRetry(pointUrl, {}, { timeoutMs: 10_000, maxRetries: 1 });
     const pointData = await pointRes.json();
     const forecastUrl = pointData.properties?.forecast;
     if (!forecastUrl) return null;
 
     // Step 2: Get the forecast
     const fcRes = await fetchWithRetry(forecastUrl, {
-      timeout: 10_000,
       headers: { "User-Agent": "Satriales/1.0 (weather-trading-bot)" },
-    }, { maxRetries: 1 });
+    }, { timeoutMs: 10_000, maxRetries: 1 });
     const fcData = await fcRes.json();
     const periods = fcData.properties?.periods;
     if (!Array.isArray(periods)) return null;
@@ -271,9 +269,18 @@ export async function fetchEnsembleForecast(
 /**
  * Compute bracket probability using ensemble forecast.
  *
- * Key improvement: sigma is the RSS of base forecast error + model spread.
- * When models disagree, uncertainty widens → probabilities spread out.
- * When models agree, sigma stays tight → confident probability peaks.
+ * Two modes, controlled by the optional `members` argument:
+ *
+ *   1. Empirical (preferred when members provided): count how many of the
+ *      GEFS 31-members land in the bracket. Captures true distribution
+ *      shape — fat tails, bimodality, skew — instead of forcing Gaussian.
+ *      Implemented in `empiricalBracketProbability()` (GFSEnsemble.ts).
+ *
+ *   2. Gaussian (fallback): sigma = RSS of base forecast error + model
+ *      spread. Used when members are unavailable (API miss, non-GFS cities,
+ *      or pre-GEFS integration callers). When models disagree, uncertainty
+ *      widens → probabilities spread out. When models agree, sigma stays
+ *      tight → confident probability peaks.
  */
 export function ensembleBracketProbability(
   ensembleHighF: number,
@@ -281,7 +288,16 @@ export function ensembleBracketProbability(
   bracketLowF: number,
   bracketHighF: number,
   hoursUntilResolution: number,
+  members?: number[],
 ): number {
+  // Empirical path — preferred when we have ≥10 GEFS members.
+  // Below 10 samples the empirical estimate is too noisy to trust over
+  // the Gaussian, so fall through.
+  if (members && members.length >= 10) {
+    return empiricalBracketProbability(members, bracketLowF, bracketHighF);
+  }
+
+  // ── Gaussian fallback ─────────────────────────────────────────────
   // Base sigma from forecast horizon
   const baseSigma = hoursUntilResolution <= 12 ? 1.5
     : hoursUntilResolution <= 24 ? 2.0
