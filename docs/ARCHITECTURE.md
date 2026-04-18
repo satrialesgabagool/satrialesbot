@@ -15,10 +15,18 @@
 | **Weather ensemble** | Query multiple weather forecast APIs, build an ensemble probability distribution, compare to Kalshi market prices, flag bracket where model prob − market prob > `minEdge` | `src/kalshi/weather/`, `src/weather/WeatherEnsemble.ts` |
 | **Whale tracker** | Watch Kalshi trade feed WebSocket, detect anomalous notional flow (z-score on rolling volume), follow directional whales | `src/kalshi/whale/` |
 
-### Planned additions (not yet implemented)
+### Shipped evaluation infrastructure (2026-04-17)
 
-- **GFS 31-member ensemble via Open-Meteo** — specifically the `ensemble_members` endpoint, which returns all 31 GEFS members rather than just a point forecast
-- **NOAA METAR observations for same-day lock** — once the day's observed high is within 1-2°F of sunset, the bracket outcome is effectively locked. Real-time airport obs let us detect this before the market re-prices
+- **Real Kalshi price polling in LIVE paper-trader** (`paper-trader.ts:refreshPricesLive`) — batched `getMarkets({tickers})` per tick, midpoint of `yes_bid`/`yes_ask` or fallback to `last_price`, clamped [0.01, 0.99], mirrored around 1.0 for NO-side. Brownian-bridge fallback per-position if the fetch fails. Tests stay Brownian because `livePollingEnabled` only flips on in `start()` under `MODE === "LIVE"`.
+- **Real Kalshi backtest** (`backtest-runner.ts`) — pulls settled KXHIGH events (`status: "settled"`, `with_nested_markets: true`), uses `market.result` as ground truth, entry price = `listTrades({ticker, max_ts, limit})` sampled 24h before `close_time`, forecasts from open-meteo `historical-forecast-api` (no lookahead). Surfaces `dataSource: "kalshi-real" | "synthetic-fallback"` on `BacktestResult` so the dashboard can warn when it falls back.
+
+### Planned / still open
+
+- **GFS 31-member ensemble via Open-Meteo** — shipped 2026-04-16; see `src/weather/GFSEnsemble.ts`.
+- **NOAA METAR observations for same-day lock** — shipped 2026-04-16; see `src/weather/METARObserver.ts`.
+- **Empirical σ calibration** (`SIGNAL_IMPROVEMENTS.md §2.1`) — not yet built; current hardcoded σ=2.0°F at 24h is tighter than the empirical ~3°F MAE.
+- **Fractional Kelly sizing** + **daily loss circuit breaker** (`SIGNAL_IMPROVEMENTS.md §3.1–3.2`) — not yet built.
+- **Pre-drawn Bernoulli in paper-trader** (`paper-trader.ts:490`) — still uses `Math.random() < modelProb` for outcomes. Real-Kalshi settlement lookup (`SIGNAL_IMPROVEMENTS.md §1.1`) is the remaining piece to make the paper-trader P&L a real model-accuracy measure.
 
 ## 2. Runtime Topology
 
@@ -51,12 +59,20 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SIM / BACKTEST MODE                           │
 │                                                                   │
-│  paper-trader.ts ──► reads JSONL ──► places virtual trades       │
-│                                      resolves after delay         │
-│                                      writes state file           │
+│  paper-trader.ts (LIVE)    ──► reads JSONL signals               │
+│                             ──► polls real Kalshi prices (tick)  │
+│                             ──► pre-drawn Bernoulli resolve*     │
 │                                                                   │
-│  backtest-runner.ts ──► Open-Meteo archive + forecast            │
-│                         simulates ensemble signals + P&L         │
+│  paper-trader.ts (BACKTEST)──► same, but Brownian-bridge prices  │
+│                                and compressed clock              │
+│                                                                   │
+│  backtest-runner.ts ──► Kalshi settled events (market.result)    │
+│                         + listTrades (pre-res entry price)       │
+│                         + open-meteo historical-forecast-api     │
+│                                                                   │
+│  * real-Kalshi settlement lookup is next on the roadmap          │
+│    (SIGNAL_IMPROVEMENTS.md §1.1); until it lands the paper       │
+│    trader's outcomes are model-internal.                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -101,9 +117,13 @@ kalshi-bot/
 │   │
 │   ├── dashboard/              ← Web dashboard (Bun + Hono + SSE)
 │   │   ├── server.ts                ← HTTP server
-│   │   ├── backtest-runner.ts       ← Programmatic backtest for the API
+│   │   ├── backtest-runner.ts       ← Real-Kalshi backtest (settled events
+│   │   │                              + listTrades pre-res entry +
+│   │   │                              historical-forecast-api)
 │   │   ├── accuracy-runner.ts       ← Forecast vs actual fetcher
-│   │   ├── paper-trader.ts          ← Live paper trading simulator
+│   │   ├── paper-trader.ts          ← Paper trader: LIVE polls real Kalshi
+│   │   │                              prices; BACKTEST uses Brownian bridge
+│   │   ├── trading-math.ts          ← Pure math (fees, settlement, etc.)
 │   │   ├── seed-demo.ts             ← Fake signal generator for dev
 │   │   └── public/index.html        ← 4-tab dashboard UI
 │   │
@@ -183,6 +203,9 @@ Written to `state/weather-sim.json` atomically on every change.
 3. **Liquidity filter**: `minBracketPrice = $0.03` skips penny brackets where Kalshi shows phantom edges (fix from feig's 0/10 live sim wipeout).
 4. **High-conviction dedup**: the scanner keys on `marketTicker + timestamp-bucket` to avoid duplicate logs within a single scan window.
 5. **Paper trader write throttle**: state file writes are capped at 5s intervals from countdown updates; trade open/close events write immediately.
+6. **KXHIGH `close_time` is midnight AFTER the measurement day** (local → UTC). So "1 hour before close" = late evening post-observation (price is already 0.01 or 0.99 — useless for entry-price sampling). The backtest defaults to sampling **24h before `close_time`** for entry prices, which lands in the morning of the measurement day when a scanning bot would realistically enter.
+7. **Kalshi trade response uses `yes_price_dollars` (string), not `yes_price` (int cents).** Despite what `src/kalshi/types.ts:187` documents, `listTrades` returns e.g. `{"yes_price_dollars": "0.4500", ...}`. `fetchPreResolutionYesPrice` in `backtest-runner.ts` has defensive string-or-number parsing; don't rely on the int field.
+8. **Paper-trader `livePollingEnabled` module flag** defaults false so tests stay deterministic. Only `start()` flips it on under `MODE === "LIVE"`. Never import the module in a test and expect the LIVE branch to fire.
 
 ## 7. Environment Variables
 

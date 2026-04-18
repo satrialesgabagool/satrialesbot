@@ -10,44 +10,54 @@ implementation.
 ## Tier 1 — Unblock honest evaluation (no trading decisions should be made until these land)
 
 ### 1.1 Real resolution against Kalshi actuals (not `Math.random()`)
+**Status:** PARTIALLY SHIPPED 2026-04-17. Real Kalshi *prices* now
+poll live in `paper-trader.ts:refreshPricesLive` (LIVE mode only),
+so unrealized P&L and the `current` column match the Kalshi app.
+Real Kalshi *resolution* is still open — `paper-trader.ts:490` still
+pre-draws `outcomeWin = Math.random() < modelProb` and line 599 uses
+that instead of looking up `market.result`. So wins/losses are still
+circular.
 **Impact:** Eliminates circular validation. This is the difference
 between "my math is internally consistent" and "my model beats the
 market."
-**Where:** `src/dashboard/paper-trader.ts:490` — replace the Bernoulli
-draw with a lookup of the real Kalshi market resolution.
+**Where:** `src/dashboard/paper-trader.ts:490` (pre-draw) + `:599`
+(resolution) — replace the Bernoulli draw with a lookup of the real
+Kalshi market result.
 **How:** Extend `KalshiClient` to expose `getMarketResult(ticker) →
-{resolved: boolean, outcome: 'yes'|'no'|null}`. In
+{resolved: boolean, outcome: 'yes'|'no'|null}` (can likely piggyback
+on the existing `getMarket(ticker)` helper added 2026-04-17 — it
+already returns `market.result` on settled markets). In
 `resolvePositions()` (paper-trader.ts:594), for LIVE mode, call that
 instead of using the pre-drawn `outcomeWin`. Keep the Bernoulli path
 for BACKTEST mode (it's fine as a sandbox there).
-**Complexity:** MEDIUM. Requires a single new Kalshi endpoint binding
-and ~20 lines of paper-trader changes. One unit test (mock
-KalshiClient) covers it.
+**Complexity:** LOW now. `getMarket()` already exists; ~20 lines of
+paper-trader changes remaining. One unit test (mock KalshiClient)
+covers it.
 
 ### 1.2 Archive-forecast API in backtest-runner
+**Status:** SHIPPED 2026-04-17 (commit `51a24bd`). `fetchHistoricalForecasts`
+now hits `historical-forecast-api.open-meteo.com/v1/forecast` with
+`start_date` and `end_date` — returns the forecast *as it was issued*
+for a given date. Lookahead eliminated.
 **Impact:** Removes lookahead bias. Backtest P&L becomes
 interpretable.
-**Where:** `src/dashboard/backtest-runner.ts:171-194` (`fetchForecasts`).
-**How:** Swap `FORECAST_API` from
-`https://api.open-meteo.com/v1/forecast` (live, returns current
-forecast with past-days padding) to
-`https://historical-forecast-api.open-meteo.com/v1/forecast` with
-`start_date` and `end_date`. That API returns the forecast *as it was
-issued* at a given point in time — no hindsight.
-**Complexity:** LOW. 10-line change to the URL and query params; all
-downstream code keeps working. 1-2 hours.
+**Where:** `src/dashboard/backtest-runner.ts` → `fetchHistoricalForecasts`.
 
 ### 1.3 Independent market price replay in backtest-runner
+**Status:** SHIPPED 2026-04-17 (commit `51a24bd`) — took the "correct"
+path (Option B). `fetchPreResolutionYesPrice` fetches real Kalshi
+trade prints via `listTrades({ticker, max_ts, limit})`, sampled 24h
+before `close_time`. Win/loss comes from `market.result` on the
+settled Kalshi market, not a weather lookup. The synthetic
+`marketBase + noise` path is preserved only as a fallback for when
+Kalshi is unreachable, and `BacktestResult.dataSource` flags which
+one ran.
 **Impact:** Eliminates the "edge = difference of two sigmas" artifact.
-**Where:** `src/dashboard/backtest-runner.ts:336-344` (synthetic
-`marketBase + noise`).
-**How:** Option A (cheap): perturb market price with a seeded noise
-source that's INDEPENDENT of the model's σ — e.g., sample a spread
-from the historical Kalshi orderbook distribution for weather
-markets. Option B (correct): ingest historical Kalshi trade prints
-and replay them. Option A is fine for a month while Option B is built.
-**Complexity:** LOW for Option A (edit one function). HIGH for Option
-B (requires Kalshi archive scraper + storage).
+First honest backtest (NYC+Chicago, 7d, minEdge=0.10): 18 trades,
+16.7% win rate, −7.2% ROI. No mystery left in the Historical tab
+numbers.
+**Where:** `src/dashboard/backtest-runner.ts` → `fetchPreResolutionYesPrice`
++ `runBacktest` main loop (kalshi-real branch).
 
 ---
 
@@ -186,35 +196,44 @@ snapshots; may need a WebSocket subscription for efficiency.
 
 ## Summary table
 
-| # | Tier | Name | Complexity | Expected impact |
-|---|---|---|---|---|
-| 1.1 | 1 | Real Kalshi resolution | MEDIUM | Enables true evaluation |
-| 1.2 | 1 | Archive-forecast API | LOW | Eliminates lookahead |
-| 1.3 | 1 | Independent market price | LOW/HIGH | Removes σ-diff artifact |
-| 2.1 | 2 | Empirical σ calibration | MEDIUM | Honest probabilities |
-| 2.2 | 2 | Ensemble-agreement filter | LOW | Fewer false positives |
-| 2.3 | 2 | Time-to-resolve gate | LOW | Avoid efficient markets |
-| 2.4 | 2 | Signal staleness check | LOW | No stale-data trades |
-| 3.1 | 3 | Fractional Kelly sizing | LOW | Geometric growth, no ruin |
-| 3.2 | 3 | Daily loss circuit breaker | LOW | Cap worst-case DD |
-| 3.3 | 3 | Raise min-edge to 12% | TRIVIAL | Stay outside noise band |
-| 4.1 | 4 | Brier-score tracking | LOW | Observability |
-| 4.2 | 4 | Skipped-signal logging | LOW | Populates Signal Monitor |
-| 4.3 | 4 | Market-liquidity filter | MEDIUM | Slippage protection |
+| # | Tier | Name | Status | Complexity | Expected impact |
+|---|---|---|---|---|---|
+| 1.1 | 1 | Real Kalshi resolution | 🟡 partial (prices yes, resolution no) | LOW | Enables true evaluation |
+| 1.2 | 1 | Archive-forecast API | ✅ shipped 2026-04-17 | LOW | Eliminates lookahead |
+| 1.3 | 1 | Independent market price | ✅ shipped 2026-04-17 (real replay) | — | Removes σ-diff artifact |
+| 2.1 | 2 | Empirical σ calibration | ⬜ open | MEDIUM | Honest probabilities |
+| 2.2 | 2 | Ensemble-agreement filter | ⬜ open | LOW | Fewer false positives |
+| 2.3 | 2 | Time-to-resolve gate | ⬜ open | LOW | Avoid efficient markets |
+| 2.4 | 2 | Signal staleness check | ⬜ open | LOW | No stale-data trades |
+| 3.1 | 3 | Fractional Kelly sizing | ⬜ open | LOW | Geometric growth, no ruin |
+| 3.2 | 3 | Daily loss circuit breaker | ⬜ open | LOW | Cap worst-case DD |
+| 3.3 | 3 | Raise min-edge to 12% | ⬜ open | TRIVIAL | Stay outside noise band |
+| 4.1 | 4 | Brier-score tracking | ⬜ open | LOW | Observability |
+| 4.2 | 4 | Skipped-signal logging | ⬜ open | LOW | Populates Signal Monitor |
+| 4.3 | 4 | Market-liquidity filter | ⬜ open | MEDIUM | Slippage protection |
 
 ## Honest assessment
 
 > If the model has no real edge over the market right now, say so
 > explicitly.
 
-**The model has no proven edge.** Nothing in the codebase measures
-model-vs-market accuracy, so the edge is an assumption, not a
-finding. The existing backtests confirm and deny nothing because
-they're contaminated by lookahead, synthetic pricing, and missing
-fees.
+**Updated 2026-04-17.** After fixing the backtest (shipped items
+1.2 and 1.3), the first honest measurement is in: **18 trades,
+16.7% win rate, −7.2% ROI** over 7 days × 2 cities at
+`minEdge=0.10`, against real Kalshi entry prices and real
+settlements with no-lookahead forecasts. That's not enough data to
+call the strategy dead, but it's a clear sign the current Gaussian
+σ=2°F model is NOT beating Kalshi — the 29% average "edge" it
+claims is mostly tail overconfidence that loses 80%+ of the time.
 
-Capital-preservation move: **do not deploy real money until Tier 1
-items 1.1 and 1.2 are complete AND show the model beating the market
-on a Brier score basis over at least 30 days of real resolutions.** If
-after that window the Brier scores are tied or the model is worse,
+Capital-preservation move: **do not deploy real money until:**
+1. Item 1.1 (real Kalshi settlement in the paper-trader) is
+   complete so the paper-trader's P&L becomes a real edge measure.
+2. Item 2.1 (empirical σ per city/horizon) is shipped — current
+   σ=2°F is tighter than the measured ~3°F MAE and is the likely
+   source of the tail overconfidence.
+3. Item 4.1 (Brier-score tracking) shows the model beating the
+   market on at least 30 days of real resolutions.
+
+If after (1)–(3) the Brier scores are tied or the model is worse,
 the strategy has no edge and should be paused.

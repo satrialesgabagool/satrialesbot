@@ -2,7 +2,43 @@
 
 High-level project history. For per-commit detail see `git log`.
 
-## [Gas-bot] Unreleased — 2026-04-16
+## [Gas-bot] 2026-04-17 — Real Kalshi data end-to-end
+
+### Changed (backtest: real Kalshi settled markets + historical forecasts)
+- **`src/dashboard/backtest-runner.ts` rewritten to use real Kalshi data.** Previously the "Would this have worked?" tab was measuring our model against itself (market price = `ourProb + narrow noise`), so positive ROI was guaranteed by construction — the synthetic-price gap called out in `LOSS_DIAGNOSIS.md §2`. Now:
+  - **Entry prices** come from `KalshiClient.listTrades({ticker, max_ts, limit})`, sampled **24h before each market's `close_time`** by default. KXHIGH markets close at midnight AFTER the measurement day, so 1–6h pre-close = post-observation (unusable — market has fully resolved). 24h lands in the morning of the measurement day, which is what a scanning bot would realistically have seen. Configurable via new `entryHoursBeforeClose` param.
+  - **Win/loss** comes directly from `market.result` as Kalshi finalized — not a weather lookup.
+  - **Forecasts** come from open-meteo `historical-forecast-api` (as-issued, no lookahead), replacing the live-forecast endpoint with `past_days` which was leaking hindsight.
+  - `BacktestResult` now carries `dataSource: "kalshi-real" | "synthetic-fallback"`, `notes: string[]`, and counts of `kalshiMarketsEvaluated`, `daysWithKalshiData`, `daysMissingKalshiData`. Synthetic path kept ONLY as a fallback for when Kalshi is unreachable; flagged in notes so users don't misread it.
+  - Trade rows carry the real Kalshi `ticker` so the dashboard can link out to each market.
+- **Dashboard Backtest tab** — new green banner "Real Kalshi data (settled markets)" with markets/days counts when `dataSource=kalshi-real`; red warning banner on synthetic fallback. Trade Log gains a **Ticker** column (clickable `https://kalshi.com/markets/...` link).
+- **`src/kalshi/KalshiClient.ts`** — added `getMarket(ticker)` helper wrapping `GET /markets?tickers=...`, used by paper-trader live polling.
+
+### Changed (paper-trader: real Kalshi polling in LIVE mode)
+- **`src/dashboard/paper-trader.ts` `refreshPrices()` split into LIVE vs BACKTEST paths.**
+  - **LIVE**: batched `KalshiClient.getMarkets({tickers})` call per tick; price = midpoint of `yes_bid`/`yes_ask` when both > 0, else `last_price`. Clamped to [0.01, 0.99]. Mirrors around 1.0 for NO-side positions. Fire-and-forget via `livePollInflight` guard so the sync tick loop isn't blocked. Brownian-bridge fallback per-position if the Kalshi fetch fails or the ticker isn't in the batch response. Warns on every 3rd consecutive failure.
+  - **BACKTEST**: unchanged Brownian-bridge path, extracted as `refreshPricesBrownian()`.
+- **`livePollingEnabled` module flag** defaults false (tests stay deterministic); `start()` flips it on only when `MODE === "LIVE"` and prints `"[live-poll] Real Kalshi market polling: ENABLED (production API)."`.
+- New constants: `LIVE_FETCH_TIMEOUT_MS = 4_000`, `LIVE_FETCH_MAX_FAILURES_BEFORE_WARN = 3`.
+
+### Added
+- **`entryHoursBeforeClose` param on `BacktestParams`** — exposes the pre-resolution price sample window so backtest callers can experiment with how early the "bot would have seen" price is taken.
+- **Data-source indicator** threaded through `BacktestResult` → API → dashboard banner so users can tell at a glance whether they're looking at real Kalshi data or the synthetic sanity fallback.
+
+### Fixed
+- **Test hygiene**: `src/dashboard/__tests__/paper-trader.test.ts` signal factory used a hardcoded `resolvesAtIso: "2026-04-18T04:00:00.000Z"` that aged into the past, causing "no early resolve" to fail after time-advance stepped past 04:00 UTC. Now uses `Date.now() + 24h` dynamically.
+
+### Ground-truth finding
+- Running the rewritten backtest against 7 days × (NYC + Chicago), `minEdge=0.10`: **18 trades, 16.7% win rate, −7.2% ROI**. The strategy's 29% average "edge" comes from aggressive long-tail disagreement with Kalshi — and the market is usually right. Matches the `LOSS_DIAGNOSIS.md` thesis that the Gaussian σ=2.0–2.4°F model has no real edge. First honest measurement we've had.
+
+### Tests
+- 46 pass / 0 fail / 314 expect() calls (unchanged count — test hygiene fix + new live-polling path covered by existing integration tests which run in BACKTEST mode and therefore don't flip the live-polling flag).
+
+### Commits
+- `3b27577` Paper trader: real Kalshi price polling in LIVE mode
+- `51a24bd` Backtest: real Kalshi settled markets + historical forecasts
+
+## [Gas-bot] 2026-04-16 — Simulation audit
 
 ### Changed (simulation audit — full paper-trader rewrite)
 - **`src/dashboard/paper-trader.ts` rewritten end to end.** Prior version had a 15-second fake-resolve, no fees, no gates, accepted whale signals, and flooded the dashboard with thousands of synthetic trades driven by the demo seeder's 3-second cadence. New version:

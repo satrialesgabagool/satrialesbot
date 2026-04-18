@@ -2,8 +2,18 @@
 
 Generated 2026-04-17 for the Gas-bot Kalshi weather-ensemble strategy.
 Based on a forensic audit of the signal pipeline, sizing logic, backtest
-runner, and paper-trader. All line numbers are against the commit that
-ships alongside this file (`Gas-bot` branch).
+runner, and paper-trader.
+
+> **2026-04-17 update — the backtest bugs called out in §1–§2 are
+> FIXED.** `backtest-runner.ts` now uses real Kalshi settled markets
+> + open-meteo `historical-forecast-api`. The first honest backtest run
+> (7 days × NYC + Chicago, `minEdge=0.10`) produced **18 trades, 16.7%
+> win rate, −7.2% ROI** — confirming the thesis below that the
+> Gaussian σ=2°F model has no real edge. The LIVE paper-trader also
+> now polls real Kalshi prices per tick (see `paper-trader.ts:refreshPricesLive`),
+> though the resolution path still uses a pre-drawn Bernoulli (§4
+> below, queued as `SIGNAL_IMPROVEMENTS.md §1.1`). See the "Post-fix
+> status" section at the bottom of this file for details.
 
 ```
 ════════════════════════════════════════════════════════════
@@ -252,16 +262,76 @@ of work to do next. It's listed as improvement #1 in
 
 ## Where in the code each problem lives
 
-| Problem | File | Lines |
-|---|---|---|
-| Lookahead: live forecast API | `src/dashboard/backtest-runner.ts` | 171–194 |
-| Synthetic market price | `src/dashboard/backtest-runner.ts` | 336–344 |
-| Fees omitted from backtest | `src/dashboard/backtest-runner.ts` | 360 (FIXED this commit) |
-| Model σ too tight | `src/weather/WeatherEnsemble.ts` | 285–329 |
-| Pre-drawn outcome | `src/dashboard/paper-trader.ts` | 490 |
-| Fixed sizing | `src/dashboard/paper-trader.ts` | 75, 478–480 |
-| No circuit breaker | `src/dashboard/paper-trader.ts` | (absent) |
-| No time-to-resolve gate | `src/dashboard/paper-trader.ts` | 353–475 |
-| No calibration tracking | (absent) | — |
+| Problem | File | Lines | Status |
+|---|---|---|---|
+| Lookahead: live forecast API | `src/dashboard/backtest-runner.ts` | `fetchHistoricalForecasts` | **FIXED 2026-04-17** — switched to `historical-forecast-api.open-meteo.com` (as-issued forecasts, no lookahead) |
+| Synthetic market price | `src/dashboard/backtest-runner.ts` | `fetchPreResolutionYesPrice` | **FIXED 2026-04-17** — entry price = real Kalshi trade print sampled 24h before `close_time`; market.result = ground truth |
+| Fees omitted from backtest | `src/dashboard/backtest-runner.ts` | settlement loop | **FIXED** — `kalshiFee(shares, entry, won)` applied in the settlement branch |
+| Model σ too tight | `src/weather/WeatherEnsemble.ts` | 285–329 | Open — tracked as `SIGNAL_IMPROVEMENTS.md §2.1` |
+| Pre-drawn outcome | `src/dashboard/paper-trader.ts` | 490 | Open — tracked as `SIGNAL_IMPROVEMENTS.md §1.1`; real Kalshi *prices* now polled live, but *resolution* still `Math.random() < modelProb` |
+| Fixed sizing | `src/dashboard/paper-trader.ts` | 75, 478–480 | Open — tracked as `SIGNAL_IMPROVEMENTS.md §3.1` |
+| No circuit breaker | `src/dashboard/paper-trader.ts` | (absent) | Open — tracked as `SIGNAL_IMPROVEMENTS.md §3.2` |
+| No time-to-resolve gate | `src/dashboard/paper-trader.ts` | 353–475 | Open — tracked as `SIGNAL_IMPROVEMENTS.md §2.3` |
+| No calibration tracking | (absent) | — | Open — tracked as `SIGNAL_IMPROVEMENTS.md §4.1` |
 
 See `SIGNAL_IMPROVEMENTS.md` for concrete prioritized fixes for each.
+
+---
+
+## Post-fix status (2026-04-17)
+
+### What's now trustworthy
+- **Dashboard Backtest tab** reflects real Kalshi outcomes against
+  real historical forecasts. The banner at the top of the tab
+  indicates `dataSource` — green "Real Kalshi data" with counts of
+  settled markets evaluated, or a red warning if Kalshi was
+  unreachable and the runner fell back to the synthetic path.
+- **LIVE paper-trader prices** come from `KalshiClient.getMarkets`
+  per tick (`refreshPricesLive`). Unrealized P&L and the `current`
+  column match what you see on the Kalshi app. No Brownian-bridge
+  fake path unless Kalshi is unreachable.
+
+### What's still NOT trustworthy (and why)
+- **LIVE paper-trader outcomes.** `paper-trader.ts:490` still
+  pre-draws `outcomeWin = Math.random() < modelProb`, and resolution
+  at line 599 uses `pos.outcomeWin` instead of looking up
+  `market.result` from Kalshi. So wins/losses on the Simulator tab
+  are still circular — they match the model's own probabilities by
+  construction. Until `SIGNAL_IMPROVEMENTS.md §1.1` lands, treat the
+  paper-trader's realized P&L as a sizing/fee/gate sanity check, not
+  an edge measurement.
+- **Model calibration.** No Brier-score tracking yet, so we still
+  can't answer "when the model says 60%, how often does it actually
+  win?" — `SIGNAL_IMPROVEMENTS.md §4.1`.
+
+### The honest backtest finding
+With real entry prices, real settlements, and no-lookahead forecasts:
+
+```
+Period:       2026-04-09 → 2026-04-15 (7 days × 2 cities)
+Markets:      84 settled brackets evaluated
+Gate:         minEdge=0.10
+Trades:       18
+Win rate:     16.7%  (3 wins / 15 losses)
+ROI:          −7.2%
+Avg edge@entry: 29.4%
+```
+
+The model's large apparent "edge" (29% avg) comes from aggressive
+tail disagreement with Kalshi — the model insists a long-tail bracket
+is 50% when the market prices it at 10%, and loses 80%+ of the time.
+This is consistent with §3 of the original diagnosis (σ=2°F is too
+tight; the model is overconfident on tails). Matching the empirical
+stddev of ~3°F in the forecast data (`within2F=86%` for NYC is an
+OK hit rate but fat-tails are real) would collapse most of these
+spurious "edges."
+
+**Bottom line:** the rewrite gives us our first honest "would this
+have worked" number, and the answer is "no, not yet." The path
+forward is the remaining Tier 2 / 3 items in
+`SIGNAL_IMPROVEMENTS.md`, specifically:
+1. Real-Kalshi resolution in the paper-trader (§1.1) so we can
+   measure model accuracy continuously, not just on a 7-day window.
+2. Empirical σ calibration (§2.1) to collapse the fake tail edges.
+3. Kelly sizing + circuit breaker (§3.1–3.2) so the *next* backtest
+   doesn't blow up the account if the model happens to work.

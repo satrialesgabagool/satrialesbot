@@ -157,7 +157,12 @@ Success output:
 [paper-trader] mode=LIVE balance=$1000 size=$50 min-edge=8% cap=5/day cooldown=30m
 [paper-trader] watching results/high-conviction.jsonl
 [paper-trader] writing state to state/weather-sim.json every 500ms
+[live-poll] Real Kalshi market polling: ENABLED (production API).
 ```
+
+The last line confirms that LIVE mode is polling real Kalshi prices
+per tick (shipped 2026-04-17). You won't see it in BACKTEST mode, which
+stays on the deterministic Brownian-bridge path.
 
 Each time a signal passes the gates, you'll see:
 
@@ -175,7 +180,11 @@ At resolution:
 ### 2.4 Switching between LIVE and BACKTEST mode
 
 **LIVE** uses the real clock. A signal emitted Monday afternoon for a
-Tuesday-high market resolves at real local-midnight Tuesday→Wednesday:
+Tuesday-high market resolves at real local-midnight Tuesday→Wednesday.
+In LIVE mode, open-position prices are polled from real Kalshi every
+tick — so the `current` column and unrealized P&L match the Kalshi app.
+Resolution (win/loss) is still a pre-drawn Bernoulli at open time; see
+`SIGNAL_IMPROVEMENTS.md §1.1` for the remaining work.
 
 ```bash
 bun run paper-trade --mode live --balance 1000

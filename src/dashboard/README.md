@@ -9,9 +9,9 @@ pipeline without touching real Kalshi markets.
 | File | Purpose |
 |------|---------|
 | **`server.ts`** | Hono HTTP server. Routes: `/api/events`, `/api/stats`, SSE `/api/events/stream`, POST `/api/backtest/run`, `/api/sim/state`, SSE `/api/sim/stream`, `/api/accuracy`. Serves `public/` statically. |
-| **`paper-trader.ts`** | Watches `results/high-conviction.jsonl`, gates signals through edge/cooldown/daily-cap filters, opens virtual positions at market price, resolves at the real `close_time` with Kalshi's 7%-of-net-winnings fee. Writes `state/weather-sim.json`. Dual mode: LIVE or BACKTEST. |
+| **`paper-trader.ts`** | Watches `results/high-conviction.jsonl`, gates signals through edge/cooldown/daily-cap filters, opens virtual positions at market price, resolves at the real `close_time` with Kalshi's 7%-of-net-winnings fee. Writes `state/weather-sim.json`. **LIVE mode polls real Kalshi prices per tick** via `KalshiClient.getMarkets` (midpoint of yes_bid/yes_ask, fallback to last_price, Brownian-bridge fallback only if Kalshi unreachable). **BACKTEST mode** uses a deterministic Brownian bridge. Dual mode: LIVE or BACKTEST. |
 | **`trading-math.ts`** | Pure math — fee calculator, settlement, Brownian-bridge price path, edge gate, timezone helpers. No I/O. Fully unit-tested. |
-| **`backtest-runner.ts`** | Programmatic backtest for the API. Uses Open-Meteo archive + forecast APIs, simulates ensemble signals, tracks equity curve. ~10s per run. |
+| **`backtest-runner.ts`** | **Real-Kalshi backtest** (shipped 2026-04-17). Fetches settled KXHIGH events (`status: "settled"`, `with_nested_markets: true`), uses `market.result` as ground truth, entry price = `KalshiClient.listTrades` sampled 24h before `close_time` (configurable via `entryHoursBeforeClose`), forecasts from open-meteo `historical-forecast-api` (as-issued, no lookahead). Returns `dataSource: "kalshi-real" \| "synthetic-fallback"` so the dashboard can warn if Kalshi was unreachable. ~10s per run. |
 | **`accuracy-runner.ts`** | Fetches forecast vs actual for the past N days. Used by the Accuracy tab. |
 | **`seed-demo.ts`** | Realistic signal generator with full metadata (resolvesAtIso, bracketLowF/highF, trueProb, marketProb). Configurable cadence via `--rate-sec`. |
 | **`public/index.html`** | Single-page 4-tab UI (Live Feed / Backtest / Simulator / Accuracy). Uses Chart.js via CDN + vanilla JS (no build step). |
@@ -73,6 +73,26 @@ bun run paper-trade --mode live --balance 1000 --size 50 --min-edge 0.08
 Resolution timestamps are absolute — a signal emitted Monday afternoon for a
 Tuesday-high market will resolve at actual local-midnight Tuesday→Wednesday.
 The open-positions countdown ticks in real seconds.
+
+**Prices come from real Kalshi.** On every tick, the paper trader batches
+a `KalshiClient.getMarkets({tickers})` call for all open-position tickers
+and updates `currentPrice` to the midpoint of `yes_bid`/`yes_ask` (falling
+back to `last_price` if one side is empty, mirrored around 1.0 for NO-side
+positions). If Kalshi is slow or errors, the position falls back to the
+Brownian-bridge price for that tick — per-position, so one stuck market
+doesn't degrade the whole simulator. On startup you'll see:
+
+```
+[live-poll] Real Kalshi market polling: ENABLED (production API).
+```
+
+Warnings print on every 3rd consecutive fetch failure.
+
+> **Caveat:** while LIVE-mode *prices* are real, LIVE-mode *resolution*
+> (win/loss) still uses a pre-drawn Bernoulli at open time
+> (`paper-trader.ts:490`). So realized P&L on closed positions still
+> matches the model's own probabilities by construction — see
+> `SIGNAL_IMPROVEMENTS.md §1.1` for the remaining work.
 
 ### BACKTEST mode (accelerated)
 
@@ -154,10 +174,21 @@ Other endpoints:
 ```javascript
 // /api/backtest/run returns:
 {
-  summary: { totalTrades, wins, losses, winRate, totalPnl, roi, avgPnlPerTrade, ... },
+  dataSource: "kalshi-real" | "synthetic-fallback",    // banner hint
+  period: { start, end },
+  summary: {
+    totalTrades, wins, losses, winRate, totalPnl, roi, avgPnlPerTrade,
+    avgEdgeAtEntry, avgEntryPrice, tradesBelowBreakeven,
+    kalshiMarketsEvaluated,     // how many settled brackets were scored
+    daysWithKalshiData,         // city-days that had a settled event
+    daysMissingKalshiData,      // city-days skipped (no Kalshi event)
+    ...
+  },
   accuracy: { overall: {...}, byCity: [...] },
-  trades: [{ date, city, bracket, entryPrice, actualHighF, won, pnl, ... }],
-  equityCurve: [{ balance, tradeIndex }, ...]
+  trades: [{ date, city, ticker, bracket, entryPrice, modelProb, edge,
+             actualHighF, won, grossPnl, feePaid, pnl, balanceAfter }],
+  notes: string[],   // e.g. "Real Kalshi settled markets: 84 brackets..."
+  equityCurve: [{ tradeIndex, balance }, ...]
 }
 
 // /api/accuracy returns:
@@ -168,6 +199,39 @@ Other endpoints:
   byCity: [{ city, n, meanError, stddev, mae, within2F, within4F }]
 }
 ```
+
+## Backtest data provenance
+
+The Backtest tab shows a banner at the top of its result:
+
+- **Green** "Real Kalshi data (settled markets)" with a count of markets
+  evaluated and city-days covered — the default. Entry prices are real
+  Kalshi trade prints sampled 24h before each market's `close_time`
+  (configurable via `BacktestParams.entryHoursBeforeClose`). Win/loss is
+  `market.result` from Kalshi. Forecasts are from open-meteo's
+  `historical-forecast-api` (as-issued, no hindsight).
+- **Red** warning "Synthetic fallback" — only appears if the Kalshi fetch
+  returned zero settled events for the requested window (e.g. transient
+  outage, or the window is before the KXHIGH series launched). The runner
+  falls back to probability-plus-noise prices so the dashboard isn't
+  bricked, but **results under this mode do NOT measure real edge.**
+
+A successful real-Kalshi run over 7 days × 2 cities completes in ~9s and
+makes O(30) API calls (one `getAllEvents` per city + one `listTrades` per
+settled market). No auth required — these endpoints are public.
+
+### Why `entryHoursBeforeClose = 24`
+
+Kalshi KXHIGH markets close at midnight *after* the measurement day
+(close_time is e.g. `2026-04-15T04:00:00Z` for the April 14 NYC high).
+"1 hour before close" is ~11pm on the measurement day — after the
+observed high has almost certainly been reached, so the market has
+converged to 0.01 or 0.99. Useless as an entry-price proxy.
+
+Sampling 24h before close lands in the morning of the measurement day,
+when the bracket is genuinely uncertain and a scanning bot would
+realistically enter. You can experiment with different windows via the
+`entryHoursBeforeClose` param in `BacktestParams`.
 
 ## Auditing the simulator
 
