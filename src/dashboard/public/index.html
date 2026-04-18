@@ -862,6 +862,9 @@
 
       <h3 class="section-title">Backtest Results</h3>
 
+      <!-- Data source banner (populated by renderBacktestResults) -->
+      <div id="btDataSourceBanner" style="display:none;margin:8px 0 16px 0;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.5"></div>
+
       <!-- Summary cards -->
       <div class="cards">
         <div class="card">
@@ -917,13 +920,18 @@
       </div>
 
       <!-- Trade log -->
-      <h3 class="section-title">Trade Log</h3>
+      <h3 class="section-title">Trade Log (example period of bot trading)</h3>
+      <div style="font-size:12px;color:#8b949e;margin-bottom:8px">
+        Each row is a trade the bot would have placed. Entry price + win/loss come from real Kalshi data when
+        <code>dataSource = "kalshi-real"</code>. Click the ticker to verify on Kalshi.
+      </div>
       <div class="scrollable-table">
         <table>
           <thead>
             <tr>
               <th>Date</th>
               <th>City</th>
+              <th>Ticker</th>
               <th>Bracket</th>
               <th>Entry</th>
               <th>Model Prob</th>
@@ -1850,6 +1858,48 @@
       const section = document.getElementById('btResults');
       section.classList.add('visible');
 
+      // Data source banner — tells the user if trades came from real Kalshi
+      // settled markets (the honest path) or the synthetic-fallback
+      // probability-plus-noise prices (only when Kalshi returned nothing).
+      const banner = document.getElementById('btDataSourceBanner');
+      if (banner) {
+        const src = data.dataSource || 'unknown';
+        const notes = Array.isArray(data.notes) ? data.notes : [];
+        const sum = data.summary || {};
+        if (src === 'kalshi-real') {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(63, 185, 80, 0.12)';
+          banner.style.border = '1px solid rgba(63, 185, 80, 0.4)';
+          banner.style.color = '#b7f0c4';
+          const ev = sum.kalshiMarketsEvaluated != null ? sum.kalshiMarketsEvaluated : '?';
+          const withData = sum.daysWithKalshiData != null ? sum.daysWithKalshiData : '?';
+          const missing = sum.daysMissingKalshiData != null ? sum.daysMissingKalshiData : '?';
+          banner.innerHTML =
+            '<strong>Data source: Kalshi (real settled markets)</strong><br>' +
+            'Entry prices = yes_bid/yes_ask midpoint. Settlements = market.result (YES/NO) as Kalshi finalized. ' +
+            'Forecasts = open-meteo historical-forecast-api (as-issued; no lookahead).<br>' +
+            '<span style="color:#8b949e">' +
+            ev + ' Kalshi brackets evaluated · ' + withData + ' city-days with data · ' + missing + ' skipped (no settled event).' +
+            '</span>';
+        } else if (src === 'synthetic-fallback') {
+          banner.style.display = 'block';
+          banner.style.background = 'rgba(248, 81, 73, 0.12)';
+          banner.style.border = '1px solid rgba(248, 81, 73, 0.5)';
+          banner.style.color = '#ffb3ae';
+          banner.innerHTML =
+            '<strong>⚠ Data source: SYNTHETIC FALLBACK — not real edge</strong><br>' +
+            'Kalshi returned zero settled events for the requested window. Prices came from a ' +
+            'probability-plus-noise model of our own forecast, not real market data. ' +
+            'Results under this mode do <em>not</em> measure whether the strategy would have beaten the market.';
+        } else {
+          banner.style.display = 'none';
+        }
+        if (notes.length > 0 && banner.style.display === 'block') {
+          const noteLines = notes.map(n => '• ' + n).join('<br>');
+          banner.innerHTML += '<div style="margin-top:8px;font-size:12px;color:#8b949e">' + noteLines + '</div>';
+        }
+      }
+
       // Summary cards — API returns { summary: {...}, trades: [...], equityCurve: [...] }
       const s = data.summary || {};
       const totalTrades = s.totalTrades || (data.trades ? data.trades.length : 0);
@@ -2020,9 +2070,13 @@
         const resultClass = t.won ? 'result-won' : 'result-lost';
         const resultText = t.won ? 'WON' : 'LOST';
         const pnlSign = t.pnl >= 0 ? '+' : '';
+        const tickerCell = t.ticker
+          ? `<a href="https://kalshi.com/markets/${encodeURIComponent(t.ticker)}" target="_blank" rel="noopener" style="font-family:monospace;font-size:11px;color:#58a6ff">${t.ticker}</a>`
+          : '<span style="color:#6e7681;font-size:11px">synthetic</span>';
         tr.innerHTML = `
           <td>${t.date || '-'}</td>
           <td>${t.city || '-'}</td>
+          <td>${tickerCell}</td>
           <td style="font-family:monospace;font-size:12px">${t.bracket || '-'}</td>
           <td>${t.entryPrice != null ? t.entryPrice.toFixed(2) : (t.entry != null ? t.entry.toFixed(2) : '-')}</td>
           <td>${t.modelProb != null ? t.modelProb.toFixed(3) : '-'}</td>
