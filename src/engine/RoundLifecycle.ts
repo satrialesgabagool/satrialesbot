@@ -128,6 +128,21 @@ export class RoundLifecycle {
     const now = Date.now();
     const { client, logger } = this.config;
 
+    // Capture BTC open price at slot start
+    if (!this.openPrice && now >= this.config.slotStartMs) {
+      const btcPrice = this.config.ticker.price;
+      if (btcPrice) {
+        this.openPrice = btcPrice;
+        logger.record("info", { message: `BTC open: $${btcPrice}`, btcOpen: btcPrice });
+      }
+    }
+
+    // Always update close price with latest BTC tick
+    const latestBtc = this.config.ticker.price;
+    if (latestBtc) {
+      this.closePrice = latestBtc;
+    }
+
     // Check sim client for fills
     const filledIds = client.tick();
     for (const orderId of filledIds) {
@@ -469,11 +484,42 @@ export class RoundLifecycle {
     const upShares = wallet.getShares(this.config.tokenIdUp);
     const downShares = wallet.getShares(this.config.tokenIdDown);
 
-    // Determine winner (would need actual market resolution)
-    // For simulation, we check the BTC price vs open price
+    // Collect fees and fill rejections from SimClient
+    const fees = this.config.client.getRoundFees();
+    const fillsRejected = this.config.client.getFillsRejected();
+
     const btcPrice = this.config.ticker.price;
     if (this.openPrice && btcPrice) {
-      const upWon = btcPrice > this.openPrice;
+      // ── Resolution uncertainty ───────────────────────────────────
+      // Polymarket's oracle samples BTC at a slightly different time
+      // than our Coinbase WebSocket. Model this as Gaussian noise:
+      //   σ_jitter = σ_1sec × √(jitter_seconds)
+      //   σ_1sec  = price × annualVol / √(seconds_per_year)
+      //
+      // At $75K with 60% vol and 1.5s jitter → σ ≈ $9.80
+      // Effect: $100 delta → ~0% flip chance (unaffected)
+      //         $10 delta  → ~31% flip chance (genuinely uncertain)
+      //         $5 delta   → ~61% flip chance (near coin-flip)
+      const annualVol = 0.60;
+      const oneSecSigma = this.openPrice * annualVol / Math.sqrt(31_536_000);
+      const jitterSeconds = 1.5; // oracle timing uncertainty
+      const jitterSigma = oneSecSigma * Math.sqrt(jitterSeconds);
+      const resolutionNoise = this.randomNormal() * jitterSigma;
+      const effectiveClose = btcPrice + resolutionNoise;
+
+      const rawUpWon = btcPrice > this.openPrice;
+      const upWon = effectiveClose > this.openPrice;
+
+      // Log when oracle noise flips the outcome
+      if (rawUpWon !== upWon) {
+        const rawDelta = ((btcPrice - this.openPrice) / this.openPrice * 100).toFixed(4);
+        this.config.logger.log(
+          `[${this.config.slug}] ⚠ Oracle noise flipped resolution! ` +
+          `BTC Δ=${rawDelta}% ($${Math.abs(btcPrice - this.openPrice).toFixed(2)}) ` +
+          `noise=$${resolutionNoise.toFixed(2)} → ${upWon ? "UP" : "DOWN"} (was ${rawUpWon ? "UP" : "DOWN"})`,
+          "yellow",
+        );
+      }
 
       if (upShares > 0) {
         const payout = wallet.resolveShares(this.config.tokenIdUp, upWon);
@@ -484,20 +530,36 @@ export class RoundLifecycle {
         pnl += payout;
       }
 
+      // Deduct fees from PnL (wallet already debited, but PnL is
+      // computed from orderHistory which doesn't include fees)
+      pnl -= fees;
+
       this.result = {
         slug: this.config.slug,
         pnl,
         orderCount,
+        fees,
+        fillsRejected,
         resolution: upWon ? "UP" : "DOWN",
         openPrice: this.openPrice,
         closePrice: btcPrice,
       };
     } else {
+      pnl -= fees;
       this.result = {
         slug: this.config.slug,
         pnl,
         orderCount,
+        fees,
+        fillsRejected,
       };
     }
+  }
+
+  /** Box-Muller transform: generate N(0,1) random variable. */
+  private randomNormal(): number {
+    const u1 = Math.random();
+    const u2 = Math.random();
+    return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
   }
 }

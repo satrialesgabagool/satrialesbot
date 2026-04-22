@@ -51,6 +51,7 @@ const LIVE          = hasFlag("--live");
 const DB_PATH       = argVal("--db",          (s) => s,   "kalshi_snipe.db");
 const KELLY_FRAC    = argVal("--kelly",       parseFloat, NaN);
 const NO_KELLY      = hasFlag("--no-kelly");
+const LOG_PATH      = argVal("--log",         (s) => s,   "snipe_log.jsonl");
 
 // ─── Banner ───────────────────────────────────────────────────────────
 
@@ -64,6 +65,7 @@ function printBanner(): void {
   console.log(`  Max hours:  ${Number.isFinite(HOURS) ? HOURS : "unlimited"}`);
   console.log(`  GUI:        ${GUI ? `http://${HOST}:${PORT}` : "disabled (run with --gui)"}`);
   console.log(`  DB:         ${DB_PATH}`);
+  console.log(`  Log:        ${LOG_PATH}`);
   console.log("");
 }
 
@@ -105,6 +107,7 @@ async function main(): Promise<void> {
     dbPath: DB_PATH,
     client,
     live: LIVE,
+    logPath: LOG_PATH,
   });
 
   // Wire Ctrl+C to graceful stop

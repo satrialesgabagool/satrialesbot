@@ -3,11 +3,15 @@ import { loadState, saveState, emptyState } from "./state";
 import { RoundLifecycle, type RoundConfig } from "./RoundLifecycle";
 import { MarketFinder, type MarketInfo } from "../market/MarketFinder";
 import { OrderBook } from "../market/OrderBook";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync } from "fs";
 import { TickerTracker } from "../market/TickerTracker";
 import { SimClient } from "../client/SimClient";
 import { SimWallet } from "../wallet/SimWallet";
 import { SignalBus } from "../signals/SignalBus";
 import { FearGreedSource } from "../signals/sources/FearGreedSource";
+import { FundingRateSource } from "../signals/sources/FundingRateSource";
+import { OpenInterestSource } from "../signals/sources/OpenInterestSource";
+import { LiquidationSource } from "../signals/sources/LiquidationSource";
 import { Logger } from "../log/Logger";
 import { getConfig } from "../util/config";
 import { acquireLock, releaseLock } from "../util/ProcessLock";
@@ -40,8 +44,12 @@ export class Engine {
     this.signalBus = new SignalBus();
     this.marketFinder = new MarketFinder(config.marketWindow);
 
-    // Register signal sources
-    this.signalBus.register(new FearGreedSource());
+    // Register signal sources — all free public APIs, no auth needed.
+    // These feed into SignalSnapshot.bias (weighted: FG 40%, FR 30%, Liq 30%).
+    this.signalBus.register(new FearGreedSource());       // alternative.me — polls 5min
+    this.signalBus.register(new FundingRateSource());     // Binance futures — polls 60s
+    this.signalBus.register(new OpenInterestSource());    // Binance futures — polls 60s
+    this.signalBus.register(new LiquidationSource());     // Binance futures — real-time WS
   }
 
   async start(): Promise<void> {
@@ -113,9 +121,12 @@ export class Engine {
           }
           this.roundsCompleted++;
           this.completedRounds.push(result);
+          this.logRoundCSV(result);
 
+          const feesInfo = result.fees ? ` | Fees: $${result.fees.toFixed(4)}` : "";
+          const rejectInfo = result.fillsRejected ? ` | Fills rejected: ${result.fillsRejected}` : "";
           this.logger.log(
-            `Session PnL: $${this.sessionPnl.toFixed(2)} | Loss: $${this.sessionLoss.toFixed(2)} | Rounds: ${this.roundsCompleted}`,
+            `Session PnL: $${this.sessionPnl.toFixed(2)} | Loss: $${this.sessionLoss.toFixed(2)} | Rounds: ${this.roundsCompleted}${feesInfo}${rejectInfo}`,
             "cyan",
           );
 
@@ -214,6 +225,46 @@ export class Engine {
       isProd,
       this.config.strategyName,
     );
+  }
+
+  private logRoundCSV(result: RoundResult): void {
+    try {
+      const csvDir = join(import.meta.dir, "../../results");
+      if (!existsSync(csvDir)) mkdirSync(csvDir, { recursive: true });
+
+      const csvPath = join(csvDir, "btc-trades.csv");
+      const newHeader = "timestamp,slug,strategy,pnl,fees,fills_rejected,orders,resolution,open_price,close_price,session_pnl";
+
+      // If existing CSV has old header (pre-fees), archive it
+      if (existsSync(csvPath)) {
+        const firstLine = readFileSync(csvPath, "utf8").split("\n")[0];
+        if (!firstLine.includes("fees")) {
+          const archivePath = csvPath.replace(".csv", `-pre-fees-${Date.now()}.csv`);
+          renameSync(csvPath, archivePath);
+          this.logger.log(`Archived old CSV (no fees) → ${archivePath}`, "yellow");
+        }
+      }
+
+      if (!existsSync(csvPath)) {
+        appendFileSync(csvPath, newHeader + "\n");
+      }
+
+      const row = [
+        new Date().toISOString(),
+        result.slug,
+        this.config.strategyName,
+        result.pnl.toFixed(2),
+        (result.fees ?? 0).toFixed(4),
+        result.fillsRejected ?? 0,
+        result.orderCount,
+        result.resolution ?? "",
+        result.openPrice?.toFixed(2) ?? "",
+        result.closePrice?.toFixed(2) ?? "",
+        this.sessionPnl.toFixed(2),
+      ].join(",") + "\n";
+
+      appendFileSync(csvPath, row);
+    } catch {}
   }
 
   private async shutdown(): Promise<void> {

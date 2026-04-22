@@ -18,11 +18,36 @@
  * Persistence: bun:sqlite via SnipeDB. Resolved trades replayed on boot.
  */
 
+import { appendFileSync } from "node:fs";
 import { KalshiClient } from "./KalshiClient";
 import { KalshiBTCFeed, type StrikeType } from "./KalshiBTCFeed";
 import type { KalshiEvent, KalshiMarket } from "./types";
 import { parseDollars, parseCount } from "./types";
 import { SnipeDB, type TradeOutcome } from "../storage/SnipeDB";
+
+// ════════════════════════════════════════════════════════════════════════
+// USER-ADJUSTABLE CONSTANTS
+// ════════════════════════════════════════════════════════════════════════
+// Change these to tune the strategy. They feed into DEFAULT_CONFIG below.
+//
+// BET_SIZE:       Flat dollar amount for each weak-conviction snipe.
+// PRICE_GATE_MIN: Minimum entry price. Below 0.70, the tape shows 49.75%
+//                 WR across 26k fills — a confirmed money pit.
+// PRICE_GATE_MAX: Maximum entry price. Above 0.85, wins pay too little
+//                 ($0.05-0.15) to overcome losses. Break-even WR at 0.85
+//                 is ~77%, well within our tape-verified range.
+
+export const BET_SIZE = 1;              // $1 per snipe (flat sizing for weak conviction)
+export const PRICE_GATE_MIN = 0.70;     // 70¢ — tape-verified floor
+export const PRICE_GATE_MAX = 0.85;     // 85¢ — tighter cap, break-even WR ~77%
+
+// PROFITABILITY GATE
+// Break-even WR at a given price = price / 1.00 (binary contract pays $1).
+// We only enter if our WR exceeds that by PROFITABILITY_MARGIN.
+// Example: at 0.75 entry, break-even is 75%, so we need ≥80% WR to fire.
+// Early in a session (< 5 resolved trades) we fall back to ASSUMED_WIN_RATE.
+export const ASSUMED_WIN_RATE = 0.789;       // 78.9% — tape baseline
+export const PROFITABILITY_MARGIN = 0.05;    // 5% safety cushion above break-even
 
 export type Stage = "prime" | "late" | "wide";
 export type Conviction = "weak" | "medium" | "strong";
@@ -39,9 +64,12 @@ export interface KalshiSnipeConfig {
   primeTimeToCloseS: number;  // 120
   lateTimeToCloseS: number;   // 300
 
-  // Price gates
+  // Price gates — tape-verified golden bucket is 0.70-0.95. The 0.55-0.70
+  // zone showed 49.75% WR (below break-even) across 26k fills. First 14.5h
+  // paper session at gateMin=0.55 confirmed: 77% WR but -$10.61 PnL because
+  // low-price bets lost more than high-price bets gained.
   gateMax: number;        // 0.95
-  gateMin: number;        // 0.55
+  gateMin: number;        // 0.70
 
   // Sizing
   sizeWeakFlat: number;   // $1
@@ -76,12 +104,19 @@ export const DEFAULT_CONFIG: KalshiSnipeConfig = {
   distMedium: 150,
   distStrong: 300,
   minTimeToCloseS: 10,
-  maxTimeToCloseS: 600,
+  // Wide stage (5-10 min) was a net drain: 78% WR × avg-win $0.17 can't
+  // overcome 22% × avg-loss $1.10.  Tape confirms: the 0.70-0.95 zone with
+  // >5 min left has NEGATIVE expected value.  Restrict to prime+late only.
+  maxTimeToCloseS: 300,
   primeTimeToCloseS: 120,
   lateTimeToCloseS: 300,
-  gateMax: 0.95,
-  gateMin: 0.55,
-  sizeWeakFlat: 1,
+  // Entry prices ≥0.85 need WR >85% to break even; even the tape's 95% WR
+  // at ≥0.95 prices shows negative PnL.  Lowering the cap to 0.85 means
+  // wins pay $0.18-0.43 each (not $0.05-0.15) and break-even WR drops to
+  // ~77%, well within our tape-verified range.
+  gateMax: PRICE_GATE_MAX,
+  gateMin: PRICE_GATE_MIN,
+  sizeWeakFlat: BET_SIZE,
   sizeMediumPct: 0.05,
   sizeStrongPct: 0.15,
   sizeCapPct: 0.25,
@@ -121,7 +156,7 @@ export interface PendingKalshiTrade {
 
 export interface HunterEvent {
   ts: number;                  // ms
-  kind: "FIRE" | "WIN" | "LOSS" | "DROPPED" | "INFO";
+  kind: "FIRE" | "WIN" | "LOSS" | "DROPPED" | "INFO" | "SCAN";
   stage?: Stage;
   market?: string;
   ticker?: string;
@@ -140,6 +175,47 @@ export interface HunterEvent {
   pnl?: number;
   bankroll?: number;
   message?: string;
+}
+
+/** Per-scan accumulator — fed by scanEvent/tryFireMarket, summarized into a SCAN event. */
+interface ScanAccum {
+  eventsSeen: number;
+  marketsSeen: number;
+  inStage: { prime: number; late: number; wide: number };
+  fires: number;
+  rejections: {
+    time: number;      // secsToClose out of [min,max]
+    status: number;    // market status not active/open
+    intrinsic: number; // can't classify winner
+    dist: number;      // distance < distWeak
+    quote: number;     // bid/ask missing
+    price: number;     // winnerPrice outside [gateMin, gateMax]
+    size: number;      // bid/ask size < 1
+    dedup: number;     // already fired
+    bankroll: number;      // insufficient funds
+    momentum: number;      // price trend falling
+    profitability: number; // WR too low for this entry price
+  };
+  nearMiss: NearMiss | null;
+  nextCloseInS: number;   // min secsToClose across all events (so we can say "next close in 4m")
+}
+
+interface NearMiss {
+  ticker: string;
+  side: "YES" | "NO";
+  stage: Stage;
+  distance: number;
+  winnerPrice: number;
+  secsToClose: number;
+  reason: string;    // e.g. "price>0.95", "size=0"
+}
+
+function fmtSecs(s: number): string {
+  if (!Number.isFinite(s)) return "–";
+  const n = Math.max(0, Math.round(s));
+  if (n < 60) return `${n}s`;
+  if (n < 3600) return `${Math.floor(n / 60)}m${(n % 60).toString().padStart(2, "0")}s`;
+  return `${(n / 3600).toFixed(1)}h`;
 }
 
 export interface HunterSnapshot {
@@ -175,7 +251,7 @@ function emptyStage() {
 }
 
 export class KalshiSnipeHunter {
-  readonly config: KalshiSnipeConfig;
+  config: KalshiSnipeConfig;
   readonly feed: KalshiBTCFeed;
   readonly client: KalshiClient;
   readonly db: SnipeDB;
@@ -191,7 +267,8 @@ export class KalshiSnipeHunter {
 
   pending: PendingKalshiTrade[] = [];
   events: HunterEvent[] = [];
-  private eventsCap: number = 200;
+  private eventsCap: number = 400;
+  private scanCount: number = 0;
 
   stageStats: Record<Stage, { trades: number; wins: number; pnl: number }> = {
     prime: emptyStage(), late: emptyStage(), wide: emptyStage(),
@@ -204,6 +281,18 @@ export class KalshiSnipeHunter {
 
   // Dedup: per (event, market, stage); each combo only fires once per life
   private fired: Set<string> = new Set();
+
+  // ── Momentum tracking ──────────────────────────────────────────────
+  // Ring buffer of winner-side prices per market ticker, sampled each
+  // scan. If price drops ≥2¢ over the last 2 min, reject (trend falling).
+  private priceHistory: Map<string, Array<{ ts: number; price: number }>> = new Map();
+  private static readonly MOMENTUM_WINDOW_MS = 120_000; // 2 minutes of history
+  private static readonly MOMENTUM_MIN_DECLINE = 0.02;  // reject if fell ≥2¢
+
+  // ── JSON logging ───────────────────────────────────────────────────
+  // Every market check writes: timestamp, ticker, price, action, reason.
+  // Set via constructor opts. Output format: one JSON object per line.
+  logPath: string | null = null;
 
   shouldStop: boolean = false;
   paused: boolean = false;
@@ -219,9 +308,11 @@ export class KalshiSnipeHunter {
     dbPath: string;
     client: KalshiClient;
     live?: boolean;
+    logPath?: string;     // path for JSONL market-check log (e.g. "snipe_log.jsonl")
   }) {
     this.config = { ...DEFAULT_CONFIG, ...(opts.config ?? {}) };
     this.client = opts.client;
+    this.logPath = opts.logPath ?? null;
     this.feed = new KalshiBTCFeed(this.client);
     this.db = new SnipeDB(opts.dbPath);
     this.live = !!opts.live && this.client.isAuthenticated;
@@ -362,6 +453,84 @@ export class KalshiSnipeHunter {
     return { size, mode: "kelly", info };
   }
 
+  // ─── Momentum detection ─────────────────────────────────────────────
+  // Tracks the winner-side price for each market over a 2-minute sliding
+  // window. Only enter if the price is rising or stable — not falling.
+  // A dropping price suggests the market is repricing AGAINST our side.
+
+  private recordPrice(ticker: string, price: number): void {
+    const now = Date.now();
+    let history = this.priceHistory.get(ticker);
+    if (!history) {
+      history = [];
+      this.priceHistory.set(ticker, history);
+    }
+    history.push({ ts: now, price });
+    // Prune entries older than the tracking window + 10s buffer
+    const cutoff = now - KalshiSnipeHunter.MOMENTUM_WINDOW_MS - 10_000;
+    while (history.length > 0 && history[0].ts < cutoff) {
+      history.shift();
+    }
+  }
+
+  /** Returns { ok, delta }. ok=false means price is falling — don't enter. */
+  private checkMomentum(ticker: string, currentPrice: number): { ok: boolean; delta: number } {
+    const history = this.priceHistory.get(ticker);
+    // Insufficient data — allow entry (don't block first-time markets)
+    if (!history || history.length < 3) {
+      return { ok: true, delta: 0 };
+    }
+    const windowStart = Date.now() - KalshiSnipeHunter.MOMENTUM_WINDOW_MS;
+    const oldest = history.find(s => s.ts >= windowStart);
+    if (!oldest) return { ok: true, delta: 0 };
+    const delta = currentPrice - oldest.price;
+    // Reject if price dropped more than the minimum decline threshold
+    return { ok: delta >= -KalshiSnipeHunter.MOMENTUM_MIN_DECLINE, delta };
+  }
+
+  // ─── JSON logging ─────────────────────────────────────────────────
+  // Writes one JSON line per market check: timestamp, ticker, price,
+  // action (buy/pass), and reason for passing. Output: snipe_log.jsonl.
+
+  private logMarketCheck(entry: {
+    market: string;
+    series: string;
+    price: number;
+    side: string;
+    secsToClose: number;
+    action: "buy" | "pass";
+    reason?: string;
+    stage?: string;
+    conviction?: string;
+    spot?: number;
+    distance?: number;
+    momentum?: number;
+    breakEvenWR?: number;    // price / 1.00 — minimum WR to not lose money
+    liveWR?: number;         // our current session WR (or assumed fallback)
+  }): void {
+    if (!this.logPath) return;
+    try {
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+      appendFileSync(this.logPath, line);
+    } catch { /* non-fatal — don't let logging failures break trading */ }
+  }
+
+  // ─── Runtime config update (for GUI slider) ───────────────────────
+
+  /** Update runtime config from the GUI. Only safe-listed keys accepted. */
+  updateConfig(patch: Record<string, unknown>): void {
+    const cfg = this.config as unknown as Record<string, unknown>;
+    const ALLOWED = new Set([
+      "maxTimeToCloseS", "primeTimeToCloseS", "lateTimeToCloseS",
+      "gateMin", "gateMax", "sizeWeakFlat",
+    ]);
+    for (const [k, v] of Object.entries(patch)) {
+      if (!ALLOWED.has(k)) continue;
+      if (typeof v !== "number" || !Number.isFinite(v)) continue;
+      cfg[k] = v;
+    }
+  }
+
   // ─── Stage classifier ──────────────────────────────────────────────
 
   private stageFor(secsToClose: number): Stage | null {
@@ -406,14 +575,64 @@ export class KalshiSnipeHunter {
       return;
     }
 
-    const spot = await this.feed.getPrice("btc");
-    if (spot <= 0) return;
-    this.spotBtc = spot;
+    // Collect the unique set of assets referenced by the returned events and
+    // fetch their Binance spots in parallel. A single /ticker/price call per
+    // asset per scan is cheap and lets us trade BTC/XRP/DOGE markets side by
+    // side without picking one "primary" spot.
+    const assetsNeeded = new Set<string>();
+    for (const ev of events) {
+      const a = this.feed.getAssetForSeries(ev.series_ticker);
+      if (a) assetsNeeded.add(a);
+    }
+    const spotEntries = await Promise.all(
+      [...assetsNeeded].map(async (a) => [a, await this.feed.getPrice(a)] as const),
+    );
+    const spotByAsset = new Map<string, number>();
+    for (const [a, p] of spotEntries) {
+      if (p > 0) spotByAsset.set(a, p);
+    }
+    // BTC spot drives the GUI header + scan summary even when we're also
+    // scanning XRP/DOGE events. Fall back to zero if the BTC Binance feed
+    // errored this tick.
+    const btcSpot = spotByAsset.get("btc") ?? 0;
+    this.spotBtc = btcSpot;
+
+    // If all crypto spot feeds failed and there are no weather events, bail.
+    // Weather events don't need spot prices (winner from market consensus).
+    const hasWeatherEvents = events.some(ev => this.feed.isWeatherSeries(ev.series_ticker));
+    if (spotByAsset.size === 0 && !hasWeatherEvents) {
+      this.pushEvent({
+        ts: Date.now(), kind: "INFO",
+        message: `all spot feeds returned 0 — skipping scan`,
+      });
+      return;
+    }
+
+    const accum: ScanAccum = {
+      eventsSeen: events.length,
+      marketsSeen: 0,
+      inStage: { prime: 0, late: 0, wide: 0 },
+      fires: 0,
+      rejections: {
+        time: 0, status: 0, intrinsic: 0, dist: 0,
+        quote: 0, price: 0, size: 0, dedup: 0, bankroll: 0,
+        momentum: 0, profitability: 0,
+      },
+      nearMiss: null,
+      nextCloseInS: Infinity,
+    };
 
     const now = Date.now() / 1000;
     for (const ev of events) {
+      const asset = this.feed.getAssetForSeries(ev.series_ticker);
+      if (!asset) continue; // unknown series — guard against stale cache
+      // Weather markets don't need spot prices (winner from market consensus).
+      // Crypto markets require a valid spot — skip if Binance failed this tick.
+      const isWeatherEvt = this.feed.isWeatherSeries(ev.series_ticker);
+      const spot = isWeatherEvt ? 0 : (spotByAsset.get(asset) ?? 0);
+      if (!isWeatherEvt && !spot) continue;
       try {
-        this.scanEvent(ev, spot, now);
+        this.scanEvent(ev, spot, now, accum);
       } catch (err) {
         this.pushEvent({
           ts: Date.now(), kind: "INFO",
@@ -421,21 +640,35 @@ export class KalshiSnipeHunter {
         });
       }
     }
+
+    this.emitScanSummary(accum, btcSpot);
   }
 
-  private scanEvent(event: KalshiEvent, spot: number, now: number): void {
+  private scanEvent(event: KalshiEvent, spot: number, now: number, accum: ScanAccum): void {
     const strikeIso = event.strike_date;
     if (!strikeIso) return;
     const closeTs = Date.parse(strikeIso) / 1000;
     if (!Number.isFinite(closeTs)) return;
 
     const secsToClose = closeTs - now;
+    if (secsToClose > 0 && secsToClose < accum.nextCloseInS) {
+      accum.nextCloseInS = secsToClose;
+    }
+
     const stage = this.stageFor(secsToClose);
-    if (!stage) return;
+    if (!stage) {
+      // Count markets as "time-rejected" for the summary
+      const n = event.markets?.length ?? 0;
+      accum.marketsSeen += n;
+      accum.rejections.time += n;
+      return;
+    }
 
     for (const m of event.markets ?? []) {
+      accum.marketsSeen++;
+      accum.inStage[stage]++;
       try {
-        this.tryFireMarket(event.event_ticker, m, spot, closeTs, stage, secsToClose);
+        this.tryFireMarket(event.event_ticker, m, spot, closeTs, stage, secsToClose, accum);
       } catch (err) {
         this.pushEvent({
           ts: Date.now(), kind: "INFO",
@@ -445,6 +678,59 @@ export class KalshiSnipeHunter {
     }
   }
 
+  private updateNearMiss(accum: ScanAccum, cand: NearMiss): void {
+    if (!accum.nearMiss) { accum.nearMiss = cand; return; }
+    // "Closeness to firing" = smallest price-gate violation
+    const cfg = this.config;
+    const violation = (p: number) =>
+      Math.min(Math.abs(p - cfg.gateMax), Math.abs(p - cfg.gateMin));
+    if (violation(cand.winnerPrice) < violation(accum.nearMiss.winnerPrice)) {
+      accum.nearMiss = cand;
+    }
+  }
+
+  private emitScanSummary(accum: ScanAccum, spot: number): void {
+    this.scanCount += 1;
+    const totalInStage =
+      accum.inStage.prime + accum.inStage.late + accum.inStage.wide;
+    const r = accum.rejections;
+    const rejBits: string[] = [];
+    if (r.dist)     rejBits.push(`dist:${r.dist}`);
+    if (r.price)    rejBits.push(`price:${r.price}`);
+    if (r.size)     rejBits.push(`size:${r.size}`);
+    if (r.quote)    rejBits.push(`quote:${r.quote}`);
+    if (r.status)   rejBits.push(`status:${r.status}`);
+    if (r.dedup)    rejBits.push(`dup:${r.dedup}`);
+    if (r.intrinsic) rejBits.push(`intr:${r.intrinsic}`);
+    if (r.bankroll) rejBits.push(`bank:${r.bankroll}`);
+    if (r.momentum) rejBits.push(`mom:${r.momentum}`);
+    if (r.profitability) rejBits.push(`profit:${r.profitability}`);
+
+    let msg =
+      `#${this.scanCount} · spot $${Math.round(spot).toLocaleString()} · ` +
+      `${accum.eventsSeen} evts · ${accum.marketsSeen} mkts · ` +
+      `in-stage ${totalInStage}` +
+      (totalInStage
+        ? ` (P:${accum.inStage.prime} L:${accum.inStage.late} W:${accum.inStage.wide})`
+        : "") +
+      ` · fires ${accum.fires}`;
+    if (rejBits.length) msg += ` · rej ${rejBits.join(" ")}`;
+
+    if (totalInStage === 0 && Number.isFinite(accum.nextCloseInS)) {
+      msg += ` · next close in ${fmtSecs(accum.nextCloseInS)}`;
+    }
+
+    if (accum.nearMiss) {
+      const nm = accum.nearMiss;
+      msg +=
+        ` · near ${nm.ticker} ${nm.side} @${nm.winnerPrice.toFixed(3)} ` +
+        `d=$${Math.round(nm.distance).toLocaleString()} ` +
+        `${fmtSecs(nm.secsToClose)} (${nm.reason})`;
+    }
+
+    this.pushEvent({ ts: Date.now(), kind: "SCAN", message: msg });
+  }
+
   private tryFireMarket(
     eventTicker: string,
     market: KalshiMarket,
@@ -452,36 +738,159 @@ export class KalshiSnipeHunter {
     closeTs: number,
     stage: Stage,
     secsToClose: number,
+    accum: ScanAccum,
   ): void {
     const cfg = this.config;
     const ticker = market.ticker;
-    if (!ticker) return;
+    if (!ticker) { accum.rejections.status++; return; }
     const status = (market.status || "").toLowerCase();
-    if (status !== "active" && status !== "open") return;
-    if (this.bankroll < cfg.minBet) return;
+    if (status !== "active" && status !== "open") { accum.rejections.status++; return; }
+    if (this.bankroll < cfg.minBet) { accum.rejections.bankroll++; return; }
 
     const dedupKey = `${eventTicker}|${ticker}|${stage}`;
-    if (this.fired.has(dedupKey)) return;
+    if (this.fired.has(dedupKey)) { accum.rejections.dedup++; return; }
 
-    const { intrinsic, stype, strike } = this.intrinsic(market, spot);
-    if (intrinsic == null || strike == null) return;
-
-    const distance = Math.abs(spot - strike);
-    if (distance < cfg.distWeak) return;
-
+    // Parse quotes early — needed for both weather (winner detection) and
+    // crypto (price gates). Avoids duplicate parsing in the weather path.
     const yesBid = parseDollars(market.yes_bid_dollars);
     const yesAsk = parseDollars(market.yes_ask_dollars);
-    if (yesAsk <= 0 || yesBid <= 0) return;
+    if (yesAsk <= 0 || yesBid <= 0) { accum.rejections.quote++; return; }
 
-    const side: "YES" | "NO" = intrinsic === 1 ? "YES" : "NO";
+    const series = eventTicker.split("-", 1)[0];
+    const isWeather = this.feed.isWeatherSeries(series);
+    const movingStrike = this.feed.isMovingStrike(series);
+
+    // ── Determine winner side ──
+    // Crypto: use spot vs strike (intrinsic value from Binance feed).
+    // Weather: no spot feed — use market consensus (expensive side wins).
+    let side: "YES" | "NO";
+    let stype: StrikeType;
+    let strike: number | null;
+    let distance: number;
+
+    if (isWeather) {
+      // Weather markets: the market price itself is the signal.
+      // If YES mid > 0.50, the market thinks YES will win — buy YES.
+      const yesMid = (yesBid + yesAsk) / 2;
+      side = yesMid >= 0.50 ? "YES" : "NO";
+      stype = this.feed.getStrikeType(market);
+      strike = this.feed.getStrikePrice(market);
+      distance = 0; // no meaningful distance metric for weather
+    } else {
+      // Crypto: determine winner from spot vs strike
+      const result = this.intrinsic(market, spot);
+      if (result.intrinsic == null || result.strike == null) {
+        accum.rejections.intrinsic++;
+        return;
+      }
+      side = result.intrinsic === 1 ? "YES" : "NO";
+      stype = result.stype;
+      strike = result.strike;
+      distance = Math.abs(spot - result.strike);
+      // 15M products: strike = spot-at-open, distance inherently tiny.
+      // For KXBTCD/KXBTC (fixed strikes), keep the $50 weak cutoff.
+      if (!movingStrike && distance < cfg.distWeak) {
+        accum.rejections.dist++;
+        return;
+      }
+    }
+
     const winnerPrice = side === "YES" ? yesAsk : 1 - yesBid;
-    if (winnerPrice <= 0 || winnerPrice > cfg.gateMax) return;
-    if (winnerPrice < cfg.gateMin) return;
+    if (winnerPrice <= 0) { accum.rejections.quote++; return; }
+
+    // Compute break-even WR for logging — every check gets this field.
+    // breakEvenWR = price / 1.00 (binary pays $1). liveWR falls back to
+    // ASSUMED_WIN_RATE until ≥5 trades resolve.
+    const breakEvenWR = winnerPrice;
+    const _resolvedCt = this.totalSnipes - this.pending.length;
+    const liveWR = _resolvedCt >= 5 ? this.totalWins / _resolvedCt : ASSUMED_WIN_RATE;
+
+    // Record price for momentum tracking — even if this market gets
+    // rejected by price gates, we want history for the next scan.
+    this.recordPrice(ticker, winnerPrice);
+    if (winnerPrice > cfg.gateMax) {
+      accum.rejections.price++;
+      this.updateNearMiss(accum, {
+        ticker, side, stage, distance, winnerPrice, secsToClose,
+        reason: `price>${cfg.gateMax.toFixed(2)}`,
+      });
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass", reason: `price>${cfg.gateMax.toFixed(2)}`,
+        stage, spot, distance, breakEvenWR, liveWR,
+      });
+      return;
+    }
+    if (winnerPrice < cfg.gateMin) {
+      accum.rejections.price++;
+      this.updateNearMiss(accum, {
+        ticker, side, stage, distance, winnerPrice, secsToClose,
+        reason: `price<${cfg.gateMin.toFixed(2)}`,
+      });
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass", reason: `price<${cfg.gateMin.toFixed(2)}`,
+        stage, spot, distance, breakEvenWR, liveWR,
+      });
+      return;
+    }
 
     const bidSize = parseCount(market.yes_bid_size_fp);
     const askSize = parseCount(market.yes_ask_size_fp);
-    if (side === "YES" && askSize < 1) return;
-    if (side === "NO" && bidSize < 1) return;
+    if (side === "YES" && askSize < 1) {
+      accum.rejections.size++;
+      this.updateNearMiss(accum, {
+        ticker, side, stage, distance, winnerPrice, secsToClose, reason: "size=0",
+      });
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass", reason: "size=0", stage, spot, distance, breakEvenWR, liveWR,
+      });
+      return;
+    }
+    if (side === "NO" && bidSize < 1) {
+      accum.rejections.size++;
+      this.updateNearMiss(accum, {
+        ticker, side, stage, distance, winnerPrice, secsToClose, reason: "size=0",
+      });
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass", reason: "size=0", stage, spot, distance, breakEvenWR, liveWR,
+      });
+      return;
+    }
+
+    // ── Momentum check ──
+    // Reject if the winner-side price has been falling over the last 2 min.
+    // A dropping price suggests the market is repricing AGAINST our side.
+    const momentum = this.checkMomentum(ticker, winnerPrice);
+    if (!momentum.ok) {
+      accum.rejections.momentum++;
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass", reason: `momentum_falling (delta=${momentum.delta.toFixed(3)})`,
+        stage, spot, distance, momentum: momentum.delta, breakEvenWR, liveWR,
+      });
+      return;
+    }
+
+    // ── Profitability filter ──
+    // Break-even WR = price / 1.00 (binary pays $1 on win).
+    // Only enter if our historical WR exceeds break-even by the safety margin.
+    // Uses live session WR once we have ≥5 resolved trades; otherwise falls
+    // back to ASSUMED_WIN_RATE (tape baseline). This self-calibrates: as the
+    // session proves a higher WR, more price levels become accessible.
+    if (liveWR < breakEvenWR + PROFITABILITY_MARGIN) {
+      accum.rejections.profitability++;
+      this.logMarketCheck({
+        market: ticker, series, price: winnerPrice, side, secsToClose,
+        action: "pass",
+        reason: `unprofitable (breakeven=${(breakEvenWR * 100).toFixed(1)}% + ${(PROFITABILITY_MARGIN * 100).toFixed(0)}% margin > WR=${(liveWR * 100).toFixed(1)}%)`,
+        stage, spot, distance, momentum: momentum.delta,
+        breakEvenWR, liveWR,
+      });
+      return;
+    }
 
     const conviction: Conviction =
       distance >= cfg.distStrong ? "strong"
@@ -489,13 +898,15 @@ export class KalshiSnipeHunter {
           : "weak";
 
     const sizing = this.computeBetSize(stage, conviction, winnerPrice);
-    if (sizing.size < cfg.minBet) return;
+    if (sizing.size < cfg.minBet) { accum.rejections.bankroll++; return; }
 
     const feePer = computeFee(winnerPrice, cfg.feeRate);
     const costPer = winnerPrice + feePer;
     let shares = sizing.size / costPer;
     let costDollars = shares * costPer;
-    if (costDollars > this.bankroll) return;
+    if (costDollars > this.bankroll) { accum.rejections.bankroll++; return; }
+
+    accum.fires += 1;
 
     // Live order path
     let orderId: string | null = null;
@@ -528,7 +939,7 @@ export class KalshiSnipeHunter {
       shares,
       totalCost: costPer,
       stage, conviction,
-      strike, spotAtEntry: spot, strikeType: stype,
+      strike: strike ?? 0, spotAtEntry: spot, strikeType: stype,
       closeTs,
       kalshiOrderId: orderId,
       orderStatus,
@@ -544,7 +955,7 @@ export class KalshiSnipeHunter {
     console.log(
       `  [${stage.toUpperCase()} ${eventTicker} ${ticker}] ${modeTag} BOUGHT ${side} ` +
       `@ ${winnerPrice.toFixed(3)} | $${costDollars.toFixed(2)} ` +
-      `(strike=$${strike.toLocaleString()}, spot=$${spot.toLocaleString(undefined, { maximumFractionDigits: 0 })}, ` +
+      `(strike=$${(strike ?? 0).toLocaleString()}, spot=$${spot.toLocaleString(undefined, { maximumFractionDigits: 0 })}, ` +
       `dist=$${distance.toLocaleString(undefined, { maximumFractionDigits: 0 })}) ` +
       `(${sizingTag}, close in ${secsToClose.toFixed(0)}s) | ` +
       `bank(committed)=$${this.bankroll.toFixed(2)}`,
@@ -553,9 +964,16 @@ export class KalshiSnipeHunter {
     this.pushEvent({
       ts: Date.now(), kind: "FIRE", stage, market: marketKey, ticker, side,
       price: winnerPrice, size: costDollars, conviction,
-      strike, spot, distance, secsToClose,
+      strike: strike ?? undefined, spot, distance, secsToClose,
       sizingMode: sizing.mode, sizingInfo: sizing.info,
       orderId, orderStatus, pnl: 0, bankroll: this.bankroll,
+    });
+
+    // Log the entry to JSONL file
+    this.logMarketCheck({
+      market: ticker, series, price: winnerPrice, side, secsToClose,
+      action: "buy", stage, conviction, spot, distance,
+      momentum: momentum.delta, breakEvenWR, liveWR,
     });
 
     this.db.saveTrade({

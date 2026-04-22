@@ -53,6 +53,8 @@ export interface RoundResult {
   slug: string;
   pnl: number;
   orderCount: number;
+  fees?: number;
+  fillsRejected?: number;
   resolution?: "UP" | "DOWN";
   openPrice?: number;
   closePrice?: number;

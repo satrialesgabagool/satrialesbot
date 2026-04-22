@@ -53,11 +53,12 @@ const DASHBOARD_HTML = `<!doctype html>
   tr:hover { background:var(--panel2); }
   .events { max-height:380px; overflow-y:auto; font-family:var(--mono); font-size:12px; }
   .events .line { padding:3px 6px; border-bottom:1px solid var(--panel2); white-space:pre; }
-  .events .line.FIRE { color:var(--blue); }
-  .events .line.WIN { color:var(--green); }
-  .events .line.LOSS { color:var(--red); }
+  .events .line.FIRE { color:var(--blue); font-weight:600; }
+  .events .line.WIN { color:var(--green); font-weight:600; }
+  .events .line.LOSS { color:var(--red); font-weight:600; }
   .events .line.DROPPED { color:var(--yellow); }
   .events .line.INFO { color:var(--dim); }
+  .events .line.SCAN { color:var(--dim); opacity:0.65; font-size:11px; }
   .btn { display:inline-block; padding:6px 14px; margin-right:8px; font-size:12px; border:1px solid var(--border); background:var(--panel2); color:var(--text); border-radius:6px; cursor:pointer; font-family:inherit; }
   .btn:hover { background:var(--panel); border-color:var(--accent); }
   .btn.danger:hover { border-color:var(--red); color:var(--red); }
@@ -87,6 +88,12 @@ const DASHBOARD_HTML = `<!doctype html>
     </div>
   </div>
   <div class="controls">
+    <label class="btn" style="cursor:default; padding:4px 10px;" title="Max seconds before close to consider a market">
+      Entry window
+      <input type="range" id="timeSlider" min="60" max="600" step="30" value="300"
+        style="width:100px; vertical-align:middle; margin:0 6px; cursor:pointer;" />
+      <span id="timeVal" style="font-family:var(--mono); font-size:12px;">5m</span>
+    </label>
     <button class="btn" id="btnPause">Pause</button>
     <button class="btn" id="btnResume">Resume</button>
     <button class="btn danger" id="btnStop">Stop</button>
@@ -209,6 +216,11 @@ function render(s) {
   $("mode").textContent = s.mode;
   $("mode").className = "mode-chip " + s.mode;
   $("pauseBadge").style.display = s.paused ? "inline-block" : "none";
+  // Sync entry window slider with current server-side config
+  if (+slider.value !== s.config.maxTimeToCloseS) {
+    slider.value = s.config.maxTimeToCloseS;
+    $("timeVal").textContent = fmtTime(s.config.maxTimeToCloseS);
+  }
   $("spot").textContent = s.spotBtc ? "$" + Math.round(s.spotBtc).toLocaleString() : "–";
   $("uptime").textContent = timeAgo(Date.now() - s.startedAtMs);
   $("lastUpdate").textContent = timeAgo(Date.now() - s.lastUpdateMs) + " ago";
@@ -319,6 +331,29 @@ async function post(path) {
     alert(path + " failed: " + e.message);
   }
 }
+// ── Entry window slider ──
+// Adjusts maxTimeToCloseS in real time so you can test 2m, 5m, 8m, 10m
+// windows without editing code. Changes take effect on the next scan.
+const slider = $("timeSlider");
+function fmtTime(s) {
+  return s < 60 ? s + "s" : Math.floor(s/60) + "m" + (s%60 ? (s%60<10?"0":"")+(s%60)+"s" : "");
+}
+slider.addEventListener("input", () => {
+  $("timeVal").textContent = fmtTime(+slider.value);
+});
+slider.addEventListener("change", async () => {
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ maxTimeToCloseS: +slider.value }),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  } catch (e) {
+    alert("Config update failed: " + e.message);
+  }
+});
+
 $("btnPause").addEventListener("click",  () => post("/api/pause"));
 $("btnResume").addEventListener("click", () => post("/api/resume"));
 $("btnStop").addEventListener("click",   () => { if (confirm("Stop the hunter?")) post("/api/stop"); });
@@ -383,6 +418,21 @@ export class KalshiSnipeServer {
     if (method === "POST" && path === "/api/stop") {
       this.hunter.stop();
       return Response.json({ ok: true, stopping: true });
+    }
+
+    // Config update — allows the GUI slider to change parameters at runtime
+    // (e.g. entry window maxTimeToCloseS). Changes take effect next scan.
+    if (method === "POST" && path === "/api/config") {
+      try {
+        const body = await req.json() as Record<string, unknown>;
+        this.hunter.updateConfig(body);
+        return Response.json({ ok: true, config: this.hunter.config });
+      } catch (err) {
+        return Response.json(
+          { ok: false, error: err instanceof Error ? err.message : String(err) },
+          { status: 400 },
+        );
+      }
     }
 
     return new Response("Not found", { status: 404 });

@@ -7,6 +7,7 @@ import type {
 } from "./ClientInterface";
 import type { OrderBook } from "../market/OrderBook";
 import { SimWallet } from "../wallet/SimWallet";
+import { calculateFee } from "../strategy/indicators/BinaryPricing";
 
 interface SimOrder {
   orderId: string;
@@ -25,6 +26,18 @@ function nextOrderId(): string {
 const MIN_LATENCY = 50;
 const MAX_LATENCY = 200;
 
+// ── Fill competition model ────────────────────────────────────────
+// At T-10s, direction is obvious and multiple bots race for stale asks.
+// SIM_FOK_FILL_RATE: probability each FOK attempt succeeds (35%).
+// FOK_COOLDOWN_MS: after a rejection, the opportunity is gone — another
+// bot grabbed that liquidity. Wait before retrying (4 seconds).
+// Combined effect: ~2-3 attempts per 10s window → ~72% overall fill rate.
+const SIM_FOK_FILL_RATE = 0.35;
+const FOK_COOLDOWN_MS = 4_000;
+
+// Polymarket crypto taker fee: 7.2% (720 bps)
+const CRYPTO_FEE_BPS = 720;
+
 /**
  * Paper trading client that simulates order fills against the real order book.
  * No actual orders are placed on Polymarket.
@@ -34,6 +47,10 @@ export class SimClient implements ClientInterface {
   private wallet: SimWallet;
   private orders: Map<string, SimOrder> = new Map();
   private tokenIds: [string, string]; // [UP, DOWN]
+  private totalFees: number = 0;
+  private fillsRejected: number = 0;
+  private fokCooldownUntil: number = 0;
+  private lastRejectReason: string = "";
 
   constructor(orderBook: OrderBook, wallet: SimWallet, tokenIdUp: string, tokenIdDown: string) {
     this.orderBook = orderBook;
@@ -112,6 +129,21 @@ export class SimClient implements ClientInterface {
     return this.wallet;
   }
 
+  /** Total Polymarket taker fees paid this round. */
+  getRoundFees(): number {
+    return this.totalFees;
+  }
+
+  /** Number of FOK fills rejected by simulated competition. */
+  getFillsRejected(): number {
+    return this.fillsRejected;
+  }
+
+  /** Reason for last fill rejection (competition vs liquidity). */
+  getLastRejectReason(): string {
+    return this.lastRejectReason;
+  }
+
   /**
    * Tick: check all open orders against current book state.
    * Called every engine tick (~100ms).
@@ -166,18 +198,19 @@ export class SimClient implements ClientInterface {
       if (this.checkFill(simOrder)) {
         return { orderId, accepted: true, filledImmediately: true, filledShares: simOrder.filledShares };
       } else {
-        // FOK rejected
+        // FOK rejected — could be competition or liquidity
         simOrder.status = "canceled";
         if (placement.action === "buy") {
           this.wallet.releaseBalance(placement.price * placement.shares);
         } else {
           this.wallet.releaseShares(placement.tokenId, placement.shares);
         }
-        return {
-          orderId,
-          accepted: false,
-          reason: "FOK order could not be fully filled",
-        };
+        const reason = this.lastRejectReason === "competition"
+          ? "Competing bot grabbed liquidity first"
+          : this.lastRejectReason === "cooldown"
+            ? "Fill cooldown — waiting for fresh liquidity"
+            : "FOK order could not be fully filled";
+        return { orderId, accepted: false, reason };
       }
     }
 
@@ -187,50 +220,106 @@ export class SimClient implements ClientInterface {
   /**
    * Check if an order can fill against the current book.
    * Returns true if the order was filled.
+   *
+   * Realism features:
+   * 1. Fill competition: FOK orders face a 35% per-attempt fill rate with
+   *    4-second cooldown — simulates other bots racing for stale liquidity.
+   * 2. Taker fees: 7.2% crypto fee deducted from wallet on every fill.
+   *    Fee formula: 0.072 * price * (1-price) per share.
    */
   private checkFill(order: SimOrder): boolean {
     const { placement } = order;
     const side = this.getSide(placement.tokenId);
-    if (!side) return false;
+    if (!side) { this.lastRejectReason = "no_side"; return false; }
 
     if (placement.action === "buy") {
       // Buy fills when best ask <= our price
       const bestAsk = this.orderBook.bestAskInfo(side);
-      if (!bestAsk || bestAsk.price > placement.price) return false;
+      if (!bestAsk || bestAsk.price > placement.price) {
+        this.lastRejectReason = "no_liquidity";
+        return false;
+      }
 
       // Check liquidity
       const availableShares = this.orderBook.askLiquidityUpTo(side, placement.price);
       const fillShares = Math.min(placement.shares, availableShares);
-      if (fillShares <= 0) return false;
+      if (fillShares <= 0) { this.lastRejectReason = "no_liquidity"; return false; }
 
       // FOK requires full fill
-      if (placement.orderType === "FOK" && fillShares < placement.shares) return false;
+      if (placement.orderType === "FOK" && fillShares < placement.shares) {
+        this.lastRejectReason = "partial_fill";
+        return false;
+      }
+
+      // ── Fill competition (FOK only) ──────────────────────────────
+      // At T-10s with clear direction, multiple bots race for stale asks.
+      // Model: 35% fill rate per attempt, 4s cooldown after rejection.
+      if (placement.orderType === "FOK") {
+        const now = Date.now();
+        if (now < this.fokCooldownUntil) {
+          this.lastRejectReason = "cooldown";
+          return false;
+        }
+        if (Math.random() > SIM_FOK_FILL_RATE) {
+          this.fillsRejected++;
+          this.fokCooldownUntil = now + FOK_COOLDOWN_MS;
+          this.lastRejectReason = "competition";
+          return false;
+        }
+      }
 
       // Execute fill
       order.filledShares = fillShares;
       order.status = "filled";
 
-      const cost = bestAsk.price * fillShares; // Fill at best ask, not our limit
-      this.wallet.debit(cost);
+      // ── Taker fee ────────────────────────────────────────────────
+      const cost = bestAsk.price * fillShares;
+      const fee = calculateFee(bestAsk.price, fillShares, CRYPTO_FEE_BPS, false);
+      this.wallet.debit(cost + fee);
+      this.totalFees += fee;
       this.wallet.addShares(placement.tokenId, fillShares);
 
       return true;
     } else {
       // Sell fills when best bid >= our price
       const bestBid = this.orderBook.bestBidInfo(side);
-      if (!bestBid || bestBid.price < placement.price) return false;
+      if (!bestBid || bestBid.price < placement.price) {
+        this.lastRejectReason = "no_liquidity";
+        return false;
+      }
 
       const fillShares = Math.min(placement.shares, bestBid.size);
-      if (fillShares <= 0) return false;
+      if (fillShares <= 0) { this.lastRejectReason = "no_liquidity"; return false; }
 
-      if (placement.orderType === "FOK" && fillShares < placement.shares) return false;
+      if (placement.orderType === "FOK" && fillShares < placement.shares) {
+        this.lastRejectReason = "partial_fill";
+        return false;
+      }
+
+      // Fill competition for sells too
+      if (placement.orderType === "FOK") {
+        const now = Date.now();
+        if (now < this.fokCooldownUntil) {
+          this.lastRejectReason = "cooldown";
+          return false;
+        }
+        if (Math.random() > SIM_FOK_FILL_RATE) {
+          this.fillsRejected++;
+          this.fokCooldownUntil = now + FOK_COOLDOWN_MS;
+          this.lastRejectReason = "competition";
+          return false;
+        }
+      }
 
       order.filledShares = fillShares;
       order.status = "filled";
 
-      const proceeds = bestBid.price * fillShares;
+      // Taker fee on sells
+      const grossProceeds = bestBid.price * fillShares;
+      const fee = calculateFee(bestBid.price, fillShares, CRYPTO_FEE_BPS, false);
       this.wallet.removeShares(placement.tokenId, fillShares);
-      this.wallet.credit(proceeds);
+      this.wallet.credit(grossProceeds - fee);
+      this.totalFees += fee;
 
       return true;
     }

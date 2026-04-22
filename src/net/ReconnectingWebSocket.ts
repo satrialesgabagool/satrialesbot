@@ -74,6 +74,27 @@ export class ReconnectingWebSocket {
     }
   }
 
+  /**
+   * Force reconnect: reset retry counter and create a fresh connection.
+   * Used by watchdog timers when a feed goes stale — handles the case
+   * where maxRetries was exhausted or the connection silently died.
+   */
+  forceReconnect(): void {
+    if (this.closed) return;
+    this.retries = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connect();
+  }
+
   get isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }

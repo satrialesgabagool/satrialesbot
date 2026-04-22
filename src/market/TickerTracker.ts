@@ -7,7 +7,10 @@ interface TickerEntry {
   source: TickerSource;
 }
 
-const BINANCE_WS = "wss://stream.binance.us:9443/ws/btcusdt@trade";
+// Binance.com global — 10x higher volume than Binance US, faster price
+// discovery. Falls back to Binance US if global is geo-blocked.
+const BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade";
+const BINANCE_US_WS = "wss://stream.binance.us:9443/ws/btcusdt@trade";
 const COINBASE_WS = "wss://ws-feed.exchange.coinbase.com";
 
 const STALE_THRESHOLD_MS = 5000;
@@ -17,6 +20,10 @@ export class TickerTracker {
   private sources: Map<TickerSource, TickerEntry> = new Map();
   private connections: ReconnectingWebSocket[] = [];
   private activeSources: TickerSource[];
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  // Keep named refs for watchdog reconnection
+  private coinbaseWs: ReconnectingWebSocket | null = null;
+  private binanceWs: ReconnectingWebSocket | null = null;
 
   constructor(sources: TickerSource[]) {
     this.activeSources = sources;
@@ -38,14 +45,24 @@ export class TickerTracker {
           break;
       }
     }
+
+    // Watchdog: if any WebSocket feed goes stale for >30s, force reconnect.
+    // This catches: silent connection death, maxRetries exhausted, hung sockets.
+    this.watchdogTimer = setInterval(() => this.checkHealth(), 15_000);
   }
 
   /** Stop all feeds. */
   stop(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     for (const ws of this.connections) {
       ws.close();
     }
     this.connections = [];
+    this.coinbaseWs = null;
+    this.binanceWs = null;
   }
 
   /** Manually set a price (used by Polymarket feed or external source). */
@@ -118,8 +135,10 @@ export class TickerTracker {
   }
 
   private connectBinance(): void {
-    const ws = new ReconnectingWebSocket({
-      url: BINANCE_WS,
+    let useFallback = false;
+
+    const makeWs = (url: string) => new ReconnectingWebSocket({
+      url,
       onMessage: (data) => {
         try {
           const msg = JSON.parse(typeof data === "string" ? data : data.toString());
@@ -128,9 +147,24 @@ export class TickerTracker {
           }
         } catch {}
       },
+      onError: (err) => {
+        // If global Binance fails (geo-blocked), fall back to Binance US
+        if (!useFallback && url === BINANCE_WS) {
+          useFallback = true;
+          console.log("[TickerTracker] Binance global unreachable, falling back to Binance US");
+          const fallback = makeWs(BINANCE_US_WS);
+          fallback.connect();
+          this.connections.push(fallback);
+          this.binanceWs = fallback;
+        }
+      },
+      maxRetries: url === BINANCE_WS ? 2 : 10, // fewer retries on global before fallback
     });
+
+    const ws = makeWs(BINANCE_WS);
     ws.connect();
     this.connections.push(ws);
+    this.binanceWs = ws;
   }
 
   private connectCoinbase(): void {
@@ -156,5 +190,34 @@ export class TickerTracker {
     });
     ws.connect();
     this.connections.push(ws);
+    this.coinbaseWs = ws;
+  }
+
+  /**
+   * Watchdog health check — runs every 15 seconds.
+   * If a feed hasn't delivered a price in 30 seconds, force reconnect.
+   * This is the safety net that prevents the bot from stalling permanently
+   * when a WebSocket dies silently or exhausts its retry budget.
+   */
+  private checkHealth(): void {
+    const STALE_LIMIT_MS = 30_000;
+    const now = Date.now();
+
+    for (const source of this.activeSources) {
+      if (source === "polymarket") continue;
+
+      const entry = this.sources.get(source);
+      const age = entry ? now - entry.updatedAt : Infinity;
+
+      if (age > STALE_LIMIT_MS) {
+        const ws = source === "coinbase" ? this.coinbaseWs : this.binanceWs;
+        if (ws) {
+          console.log(
+            `[TickerTracker] ${source} stale for ${(age / 1000).toFixed(0)}s — forcing reconnect`,
+          );
+          ws.forceReconnect();
+        }
+      }
+    }
   }
 }
