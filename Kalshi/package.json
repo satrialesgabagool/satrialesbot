@@ -1,0 +1,22 @@
+{
+  "name": "satriales-kalshi",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "snipe": "bun run kalshi-snipe-live.ts",
+    "weather": "bun run kalshi-weather-live.ts",
+    "backtest": "bun run kalshi-backtest.ts",
+    "tape:collect": "bun run kalshi-tape-collect.ts",
+    "tape:report": "bun run kalshi-tape-report.ts",
+    "dashboard": "bun run src/dashboard/server.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.12.14"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "prettier": "^3.4.2",
+    "typescript": "^6.0.2"
+  }
+}

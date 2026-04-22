@@ -1,42 +1,30 @@
 # ============================================================
-# Python (for 'Legacy - Python/' — retired Python bot, retained for reference)
+# Shared
 # ============================================================
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-.venv/
-venv/
-env/
-ENV/
+node_modules/
+dist/
+.env
+*.lock
+!package.json
 
-# SQLite databases (trading data — regenerated on run)
+# SQLite databases
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 
+# Logs
+*.log
+**/logs/*.ndjson
+
+# Runtime state
+**/state/*.json
+**/state/*.lock
+
 # Generated reports
 reports/
 *.png
 *.pdf
-
-# Trader log files (regenerated on each run)
-*.log
-
-# ============================================================
-# Node/TypeScript (for TS bot)
-# ============================================================
-node_modules/
-dist/
-.env
-state/*.json
-state/*.lock
-logs/*.log
-logs/*.ndjson
-results/
-*.lock
 
 # ============================================================
 # IDE / OS
@@ -56,3 +44,10 @@ CLAUDE.local.md
 # Backups
 *.bak
 *.tmp
+
+# Python legacy
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
