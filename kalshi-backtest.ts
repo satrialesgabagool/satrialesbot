@@ -26,10 +26,24 @@ function argVal(flag: string, fallback: number): number {
 const STARTING_BALANCE = argVal("--balance", 500);
 const LADDER_BUDGET = argVal("--budget", 15);
 const MAX_LEGS = argVal("--max-legs", 6);
-const MIN_EDGE = argVal("--min-edge", 0.15);
+const MIN_EDGE = argVal("--min-edge", 0.10);
 const HOURS_OUT = argVal("--hours-out", 24);
 const DAYS_BACK = argVal("--days-back", 30);
 const DAYS_LAG = argVal("--days-lag", 3); // archive data lag
+// New strategy filters (match live bot defaults)
+const MIN_BRACKET_PRICE = argVal("--min-bracket-price", 0.03);
+const MAX_TAIL_SIGMA = argVal("--max-tail-sigma", 0.8);
+const MAX_EDGE = argVal("--max-edge", 0.40);
+const MAX_HOURS_TO_ENTRY = argVal("--max-hours", 36);
+const KALSHI_FEE_RATE = 0.07;
+// Realism tunables for simulating how Kalshi prices are set:
+//   MARKET_SIGMA_MULT — market's implied sigma ÷ our forecast sigma
+//     > 1.0 = market less confident than us (we have edge) [idealized]
+//     = 1.0 = market as smart as us (no informational edge)
+//     < 1.0 = market smarter than us (we're the dumb money)
+//   SLIPPAGE_CENTS — cents added to the ask we pay (cost of the spread)
+const MARKET_SIGMA_MULT = argVal("--market-sigma-mult", 1.75);
+const SLIPPAGE_CENTS = argVal("--slippage", 0.0);
 
 // Kalshi US cities
 const CITIES: Record<string, [number, number]> = {
@@ -200,11 +214,11 @@ function bracketProb(forecastF: number, spreadF: number, lowF: number, highF: nu
   return Math.max(0, Math.min(1, pHigh - pLow));
 }
 
-// Simulate market price (market uses wider sigma = less confident)
+// Simulate market price — realism tunable via MARKET_SIGMA_MULT + SLIPPAGE_CENTS
 function simulateMarketPrice(forecastF: number, bracket: KalshiBracket, hoursOut: number): number {
-  const marketSigma = hoursOut <= 24 ? 3.5 : 5.0; // market overestimates uncertainty
-  const baseProb = bracketProb(forecastF, 0, bracket.lowF, bracket.highF, hoursOut);
-  // Recalculate with wider sigma to get market's implied prob
+  // Our model's sigma at this horizon
+  const ourSigma = hoursOut <= 12 ? 1.5 : hoursOut <= 24 ? 2.0 : hoursOut <= 48 ? 3.0 : hoursOut <= 72 ? 4.0 : 5.0;
+  const marketSigma = ourSigma * MARKET_SIGMA_MULT;
   const zLow = isFinite(bracket.lowF) ? (bracket.lowF - 0.5 - forecastF) / marketSigma : -Infinity;
   const zHigh = isFinite(bracket.highF) ? (bracket.highF + 0.5 - forecastF) / marketSigma : Infinity;
   const pLow = isFinite(zLow) ? normCdf(zLow) : 0;
@@ -214,6 +228,9 @@ function simulateMarketPrice(forecastF: number, bracket: KalshiBracket, hoursOut
   // Add noise ±3% to simulate real market imperfection
   const noise = (Math.random() - 0.5) * 0.06;
   marketPrice = Math.max(0.01, Math.min(0.99, marketPrice + noise));
+
+  // Slippage — we pay the ask, not the mid. Add cents on top.
+  marketPrice = Math.min(0.99, marketPrice + SLIPPAGE_CENTS / 100);
 
   // Round to cents (Kalshi pricing)
   return Math.round(marketPrice * 100) / 100;
@@ -239,11 +256,32 @@ function buildLadder(
   // Score each bracket
   const candidates: { bracket: KalshiBracket; ourProb: number; marketPrice: number; edge: number }[] = [];
 
+  // Effective sigma used by tail filter (matches live bot math)
+  const baseSigma = hoursOut <= 12 ? 1.5 : hoursOut <= 24 ? 2.0 : hoursOut <= 48 ? 3.0 : hoursOut <= 72 ? 4.0 : 5.0;
+  const effSigma = Math.max(1.5, Math.sqrt(baseSigma ** 2 + spreadF ** 2));
+
   for (const bracket of brackets) {
     const ourProb = bracketProb(forecastF, spreadF, bracket.lowF, bracket.highF, hoursOut);
     const marketPrice = simulateMarketPrice(forecastF, bracket, hoursOut);
+
+    // Filter 1: skip dead + penny brackets (no real liquidity)
+    if (marketPrice < MIN_BRACKET_PRICE || marketPrice > 0.95) continue;
+
+    // Filter 2: tail-bracket filter — skip if forecast is far outside bracket
+    const bLow = isFinite(bracket.lowF) ? bracket.lowF : -Infinity;
+    const bHigh = isFinite(bracket.highF) ? bracket.highF : Infinity;
+    let distAway = 0;
+    if (forecastF < bLow) distAway = bLow - forecastF;
+    else if (forecastF > bHigh) distAway = forecastF - bHigh;
+    const distSigmas = distAway / effSigma;
+    if (distSigmas > MAX_TAIL_SIGMA) continue;
+
     const edge = ourProb - marketPrice;
-    if (edge >= MIN_EDGE && marketPrice >= 0.01 && marketPrice <= 0.90) {
+    // Filter 3: max-edge sanity check (only on tail bets — interior high-edge is legit)
+    const isTailBet = distAway > 0;
+    if (isTailBet && edge > MAX_EDGE) continue;
+
+    if (edge >= MIN_EDGE) {
       candidates.push({ bracket, ourProb, marketPrice, edge });
     }
   }
@@ -259,14 +297,10 @@ function buildLadder(
     if (remaining <= 0.50) break;
 
     // Edge-weighted sizing: bigger edge → bigger allocation
+    // (cheap bracket bonus removed — was amplifying overpriced tail bets)
     const weight = cand.edge / candidates.reduce((s, c) => s + c.edge, 0);
-    let legBudget = Math.min(remaining, budget * weight * 1.5); // allow slight over-weight
+    let legBudget = Math.min(remaining, budget * weight * 1.5);
     legBudget = Math.max(1, Math.min(legBudget, remaining));
-
-    // Cheap bracket bonus (≤$0.10 → 2x)
-    if (cand.marketPrice <= 0.10) {
-      legBudget = Math.min(remaining, legBudget * 2);
-    }
 
     const shares = Math.floor(legBudget / cand.marketPrice);
     if (shares < 1) continue;
@@ -291,8 +325,12 @@ function resolveLeg(leg: LadderLeg, actualHighF: number): { won: boolean; pnl: n
   const inBracket =
     actualHighF >= (isFinite(leg.bracket.lowF) ? leg.bracket.lowF : -Infinity) &&
     actualHighF <= (isFinite(leg.bracket.highF) ? leg.bracket.highF : Infinity);
-  const pnl = inBracket ? (leg.shares * 1.0 - leg.cost) : -leg.cost;
-  return { won: inBracket, pnl };
+  if (!inBracket) return { won: false, pnl: -leg.cost };
+  // Kalshi charges 7% on net winnings for wins (not gross payout, not losses)
+  const payout = leg.shares * 1.0;
+  const grossWin = payout - leg.cost;
+  const fee = grossWin * KALSHI_FEE_RATE;
+  return { won: true, pnl: grossWin - fee };
 }
 
 // ─── Main ───────────────────────────────────────────────────────────

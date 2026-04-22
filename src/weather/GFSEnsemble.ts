@@ -102,25 +102,39 @@ function resolveCity(city: string): { lat: number; lon: number } | null {
 }
 
 /**
- * Identify GEFS member keys in an Open-Meteo ensemble response.
+ * Identify ensemble member keys in an Open-Meteo response.
  *
- * The control run is exposed as bare `temperature_2m`, and the 30 perturbed
- * members are `temperature_2m_member01` through `temperature_2m_member30`.
+ * With `models=gfs025,ecmwf_ifs025` Open-Meteo returns 82 total members:
+ *   GFS (NCEP GEFS025): 1 control + 30 perturbed = 31
+ *     - temperature_2m_ncep_gefs025                      (control)
+ *     - temperature_2m_member01_ncep_gefs025 … member30  (30 members)
+ *   ECMWF (IFS 0.25°): 1 control + 50 perturbed = 51
+ *     - temperature_2m_ecmwf_ifs025_ensemble             (control)
+ *     - temperature_2m_member01_ecmwf_ifs025_ensemble … member50
+ *
+ * Match any key starting with `temperature_2m` that has array values.
+ * This handles both single-model and multi-model responses uniformly.
  */
 function findMemberKeys(hourly: Record<string, unknown>): string[] {
   const keys: string[] = [];
-  if (Array.isArray(hourly["temperature_2m"])) keys.push("temperature_2m");
   for (const k of Object.keys(hourly)) {
-    if (/^temperature_2m_member\d+$/.test(k) && Array.isArray(hourly[k])) {
-      keys.push(k);
-    }
+    if (k === "time") continue;
+    if (!k.startsWith("temperature_2m")) continue;
+    if (!Array.isArray(hourly[k])) continue;
+    keys.push(k);
   }
   return keys;
 }
 
 /**
- * Fetch GEFS 31-member ensemble for a city, aggregate hourly values into
- * daily highs/lows per member. Returns null on network error / missing city.
+ * Fetch combined GFS+ECMWF 82-member ensemble for a city, aggregate hourly
+ * values into daily highs/lows per member. Returns null on network error /
+ * missing city.
+ *
+ * 82 members total (31 GFS + 51 ECMWF) is materially better than 31:
+ * - Tighter empirical probability estimates (1/82 ≈ 1.2% resolution)
+ * - Captures multi-model skew that single-family ensembles miss
+ * - Helps when GFS and ECMWF disagree (classic "weather pattern uncertainty")
  */
 export async function fetchGFSEnsemble(
   city: string,
@@ -133,8 +147,10 @@ export async function fetchGFSEnsemble(
   url.searchParams.set("latitude", coords.lat.toString());
   url.searchParams.set("longitude", coords.lon.toString());
   url.searchParams.set("hourly", "temperature_2m");
-  // `gfs025` exposes all 31 members individually; `gfs_seamless` blends them.
-  url.searchParams.set("models", "gfs025");
+  // gfs025: 1 control + 30 perturbed = 31 GFS members
+  // ecmwf_ifs025: 1 control + 50 perturbed = 51 ECMWF members
+  // Total: 82 members for empirical bracket probability
+  url.searchParams.set("models", "gfs025,ecmwf_ifs025");
   url.searchParams.set("temperature_unit", "fahrenheit");
   url.searchParams.set("timezone", "auto");
   url.searchParams.set("forecast_days", Math.min(daysAhead + 1, 16).toString());

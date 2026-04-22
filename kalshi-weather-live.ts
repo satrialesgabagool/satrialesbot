@@ -29,7 +29,7 @@ function argVal(flag: string, fallback: number): number {
 }
 
 const BALANCE = argVal("--balance", 500);
-const MIN_EDGE = argVal("--min-edge", 0.15);
+const MIN_EDGE = argVal("--min-edge", 0.10);  // lowered from 0.15 per backtest (Apr 22)
 const LADDER_BUDGET = argVal("--ladder-budget", 15);
 const MAX_LEGS = argVal("--max-legs", 6);
 const SCAN_INTERVAL_MIN = argVal("--scan-interval", 5);
@@ -105,7 +105,9 @@ ${c.blue}${c.bold}  ╔═══════════════════
   ${c.dim}Models:${c.reset}            Open-Meteo + ECMWF + GFS + NOAA
   ${c.dim}Max model spread:${c.reset}  ±${MAX_SPREAD.toFixed(0)}°F
   ${c.dim}Min bracket:${c.reset}       $0.03 (skip penny brackets)
-  ${c.dim}Max tail σ:${c.reset}        1.0 (skip brackets far from forecast)
+  ${c.dim}Max tail σ:${c.reset}        0.8 (skip clear tails, keep adjacent brackets)
+  ${c.dim}Max edge:${c.reset}          40% (skip if market disagrees too strongly)
+  ${c.dim}Max horizon:${c.reset}       36h (skip far-out markets)
   ${c.dim}Sizing:${c.reset}            Pure edge-weighted (cheap bonus removed)
   ${c.dim}Fees:${c.reset}              Kalshi 7% on net winnings
   ${c.dim}GFS ensemble:${c.reset}      31-member empirical (when available)
@@ -255,7 +257,9 @@ async function main() {
     maxModelSpreadF: MAX_SPREAD,
     minBracketPrice: 0.03,    // skip $0.01-$0.02 penny brackets (no real liquidity)
     minYesBid: 0,             // Kalshi penny markets have no bids — rely on price filter
-    maxTailSigma: 1.0,        // skip brackets where forecast is >1σ outside the bracket
+    maxTailSigma: 0.8,        // skip clear tails (>0.8σ) but keep adjacent brackets
+    maxEdge: 0.40,            // skip "too good to be true" — market probably knows better
+    maxHoursToEntry: 36,      // only enter within 36h — NWP error >36h is too wide
     marketFinder: kalshiFinder,
     exchange: "kalshi",
     // Snipe mode — buy the winning bracket after actual temp is observed

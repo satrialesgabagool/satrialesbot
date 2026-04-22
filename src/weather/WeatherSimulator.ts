@@ -17,6 +17,7 @@ import { fetchObservedHigh, findWinningBracket, type ObservedTemp } from "./Weat
 import { detectSameDayLock, lockedBracketProbability, type METARLockResult } from "./METARObserver";
 import { kalshiFee } from "./KalshiFees";
 import { fetchWithRetry } from "../net/fetchWithRetry";
+import { KalshiClient } from "../kalshi/KalshiClient";
 import { appendFileSync, existsSync, writeFileSync, readFileSync, renameSync, mkdirSync } from "fs";
 import { join } from "path";
 
@@ -103,6 +104,10 @@ export interface SimulatorConfig {
   minYesBid: number;
   /** Maximum bracket distance from forecast in sigmas — skips unreliable tail bets */
   maxTailSigma: number;
+  /** Maximum edge to accept (skip "too good to be true" bets — market probably knows) */
+  maxEdge: number;
+  /** Maximum hours-to-resolution at entry time — blocks far-horizon bets where NWP error is too wide */
+  maxHoursToEntry: number;
   /** Custom market finder function — defaults to Polymarket's findWeatherMarkets */
   marketFinder?: MarketFinderFn;
   /** Exchange label for display/logging */
@@ -132,7 +137,7 @@ export interface SimulatorState {
 
 const DEFAULT_CONFIG: SimulatorConfig = {
   startingBalance: 500,
-  minEdge: 0.15,
+  minEdge: 0.10,           // backtest shows 0.10 yields +152% ROI vs 0.15 at +39% (5-run mean)
   ladderBudget: 15,        // $15 spread across 4-6 brackets per market
   maxLadderLegs: 6,
   maxTotalPositions: 50,
@@ -143,7 +148,9 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   maxModelSpreadF: 4.0,    // skip when models disagree by >4°F
   minBracketPrice: 0.03,   // skip $0.01-$0.02 brackets (no real liquidity)
   minYesBid: 0,            // 0 = don't filter by bid (Kalshi penny markets have no bids)
-  maxTailSigma: 1.0,       // skip brackets where forecast is >1σ outside the bracket
+  maxTailSigma: 0.8,       // skip brackets where forecast is >0.8σ outside the bracket
+  maxEdge: 0.40,           // skip suspiciously large edge (market probably knows better)
+  maxHoursToEntry: 36,     // only enter within 36h of resolution — NWP error too wide beyond that
   exchange: "polymarket",
   // Snipe defaults (disabled by default — enable for Kalshi)
   snipeEnabled: false,
@@ -419,6 +426,28 @@ export class WeatherSimulator {
     const snipeTag = this.config.snipeEnabled ? " + snipe mode" : "";
     this.log(`Weather simulator v2 started (ladder strategy + ensemble forecasts${snipeTag})`, "cyan");
 
+    // One-time audit: check closed positions against Kalshi's official result.
+    // Catches any past resolutions that used a fallback data source and got the
+    // outcome wrong (e.g. METAR hourly peak missing the true daily max).
+    if (this.config.exchange === "kalshi" && this.state.closedPositions.length > 0) {
+      this.log("Auditing closed positions against Kalshi official results...", "cyan");
+      await this.auditClosedPositions();
+    }
+
+    // Reconcile state counters (deployed/totalPnl/balance) from positions
+    // as source of truth. Fixes any drift from bugs like missed balance
+    // deductions on snipe entries (observed Apr 20 — $45 phantom balance).
+    const { changes } = this.reconcileState();
+    if (Object.keys(changes).length > 0) {
+      this.log("State reconciliation applied:", "cyan");
+      for (const [k, [b, a]] of Object.entries(changes)) {
+        this.log(`  ${k}: ${b.toFixed(2)} → ${a.toFixed(2)}  (Δ ${(a - b).toFixed(2)})`, "yellow");
+      }
+      this.saveState();
+    } else {
+      this.log("State reconciliation: counters already consistent ✓", "dim");
+    }
+
     // Initial scan
     await this.scanAndTrade();
     if (this.config.snipeEnabled) await this.scanForSnipes();
@@ -527,6 +556,17 @@ export class WeatherSimulator {
         continue;
       }
 
+      // Horizon filter: skip far-out markets where forecast error is too wide.
+      // Normal NWP error at 72h is 3-5°F — that covers 2-3 of our 2°F brackets,
+      // so per-bracket probabilities are mostly noise. Wait until we're closer.
+      if (hoursToRes > this.config.maxHoursToEntry) {
+        this.log(
+          `SKIP ${market.city} ${market.date} (${market.type}): ${hoursToRes.toFixed(1)}h horizon > ${this.config.maxHoursToEntry}h limit — forecast error too wide`,
+          "yellow"
+        );
+        continue;
+      }
+
       this.log(
         `${market.city} ${market.date} (${market.type}): ` +
         `ensemble=${forecastTempF.toFixed(0)}°F spread=±${spreadF.toFixed(1)}°F [${modelNames}]`,
@@ -582,6 +622,13 @@ export class WeatherSimulator {
         if (distSigmas > this.config.maxTailSigma) continue;
 
         const edge = prob - marketPrice;
+        // Skip suspiciously large edges — if our model says +40% over the market,
+        // the market probably knows something we don't (or our model is wrong).
+        // Exception: if forecast is INSIDE the bracket (distAway=0), high edge
+        // is legitimate — it's just thin market liquidity on an obvious bracket,
+        // not market disagreement. Only apply maxEdge to tail bets.
+        const isTailBet = distAway > 0;
+        if (isTailBet && edge > this.config.maxEdge) continue;
         if (edge >= this.config.minEdge) {
           candidates.push({ bracket, prob, edge });
         }
@@ -824,6 +871,7 @@ export class WeatherSimulator {
       // Deploy
       this.state.positions.push(pos);
       this.state.deployed += cost;
+      this.state.balance -= cost;  // FIX: was missing; each snipe was inflating balance
       this.snipedKeys.add(snipeKey);
       this.logTrade("SNIPE", pos);
       this.onPositionOpened?.(pos);
@@ -854,22 +902,41 @@ export class WeatherSimulator {
   }
 
   /**
-   * Fetch the real recorded high/low from Open-Meteo archive API.
-   * Returns null if data isn't available yet (archive has ~1-2 day lag).
+   * Fetch the real recorded high/low.
+   *
+   * Priority:
+   *  1. METAR (aviationweather.gov) — same-day data, locked peak detection.
+   *     Only used for daily highs (METAR peak = day's high). Returns as soon
+   *     as the peak is locked (three-condition criteria in METARObserver).
+   *  2. Open-Meteo archive — canonical source for past days, ~1-2 day lag.
+   *  3. Open-Meteo forecast with past_days — covers the gap window.
+   *
+   * Returns null if all three sources fail.
    */
   private async fetchActualTemp(
     city: string,
     date: string,
     type: "high" | "low",
   ): Promise<{ tempF: number; source: string } | null> {
-    // Find coordinates
+    // 1. Try METAR for same-day/recent highs (no waiting for archive lag)
+    if (type === "high") {
+      try {
+        const lock = await detectSameDayLock(city, date);
+        if (lock && lock.locked) {
+          // Round to integer to match NWS Daily Climate Report convention
+          return { tempF: Math.round(lock.peakTempF), source: `metar-${lock.station}` };
+        }
+      } catch {}
+    }
+
+    // Find coordinates for the Open-Meteo fallback paths
     const key = Object.keys(CITY_COORDS).find(
       k => k === city.toLowerCase() || city.toLowerCase().includes(k) || k.includes(city.toLowerCase())
     );
     if (!key) return null;
     const [lat, lon] = CITY_COORDS[key];
 
-    // Try Open-Meteo archive API first (most reliable for past data)
+    // 2. Try Open-Meteo archive API (canonical for past data, 1-2 day lag)
     try {
       const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&daily=temperature_2m_max,temperature_2m_min&timezone=auto&start_date=${date}&end_date=${date}`;
       const res = await fetchWithRetry(url, {}, { timeoutMs: 10_000, maxRetries: 1 });
@@ -911,10 +978,36 @@ export class WeatherSimulator {
 
   // ─── Resolution ──────────────────────────────────────────────────
 
+  /**
+   * Fetch official Kalshi resolutions for all brackets in an event.
+   * Returns map of ticker → "yes" | "no" | null (null = not yet finalized).
+   * Kalshi's own `result` field is ground truth — overrides any forecast or
+   * METAR-based inference which can be wrong due to sampling (see Apr 16
+   * Miami: METAR hourly peak was 81°F but true peak was 82-83°F).
+   */
+  private async fetchKalshiResults(eventTicker: string): Promise<Map<string, "yes" | "no" | null>> {
+    const client = new KalshiClient({ demo: false });
+    const out = new Map<string, "yes" | "no" | null>();
+    try {
+      const res = await client.getMarkets({ event_ticker: eventTicker, limit: 100 });
+      for (const m of res.markets ?? []) {
+        const r = (m as any).result;
+        const status = ((m as any).status || "").toLowerCase();
+        if (status === "finalized" && (r === "yes" || r === "no")) {
+          out.set(m.ticker, r);
+        } else {
+          out.set(m.ticker, null);
+        }
+      }
+    } catch (err) {
+      this.log(`Kalshi result fetch failed for ${eventTicker}: ${err}`, "yellow");
+    }
+    return out;
+  }
+
   async checkResolutions() {
     const now = Date.now();
     const toResolve: WeatherPosition[] = [];
-    const notReady: WeatherPosition[] = [];
 
     for (const pos of this.state.positions) {
       const endMs = new Date(pos.market.endDate).getTime();
@@ -925,7 +1018,7 @@ export class WeatherSimulator {
 
     if (toResolve.length === 0) return;
 
-    // Group by market for batch resolution
+    // Group by event for batch resolution
     const byMarket = new Map<string, WeatherPosition[]>();
     for (const pos of toResolve) {
       const key = pos.market.eventId;
@@ -935,17 +1028,105 @@ export class WeatherSimulator {
 
     const resolved: WeatherPosition[] = [];
 
-    for (const [_, positions] of byMarket) {
+    for (const [eventTicker, positions] of byMarket) {
       const market = positions[0].market;
 
-      // Fetch ACTUAL recorded temperature
+      // Tier 1 (preferred): Kalshi official result. This is the source of truth —
+      // it's what Kalshi actually pays out on, derived from NWS Daily Climate Report.
+      const kalshiResults = await this.fetchKalshiResults(eventTicker);
+      const anyFinalized = [...kalshiResults.values()].some(v => v !== null);
+
+      if (anyFinalized) {
+        // At least some brackets finalized — resolve every position whose bracket has a result
+        const ladderCost = positions.reduce((s, p) => s + p.cost, 0);
+        this.log(
+          `RESOLVING ${market.city} ${market.date} (${market.type}) — ` +
+          `Kalshi official [${positions.length} legs, $${ladderCost.toFixed(2)} deployed]`,
+          "magenta"
+        );
+
+        let ladderPnl = 0;
+        let legsResolvedThisLadder = 0;
+
+        for (const pos of positions) {
+          const ticker = (pos.bracket as any).slug || (pos.bracket as any).conditionId;
+          const result = kalshiResults.get(ticker);
+          if (result == null) {
+            // This specific bracket not finalized yet — skip, retry next scan
+            continue;
+          }
+
+          const b = pos.bracket;
+          if (result === "yes") {
+            // Kalshi charges 7% on net winnings (payout − stake), losses are fee-free
+            const payout = pos.shares * 1.0;
+            const fee = kalshiFee(pos.shares, pos.entryPrice, true);
+            pos.pnl = payout - pos.cost - fee;
+            pos.status = "won";
+            this.state.balance += payout - fee;
+            this.state.wins++;
+            this.log(
+              `  WON  ${this.bracketLabel(b)} → ${pos.shares}sh × $1.00 = $${payout.toFixed(2)} (cost $${pos.cost.toFixed(2)}, fee $${fee.toFixed(2)}) → +$${pos.pnl.toFixed(2)}`,
+              "green"
+            );
+          } else {
+            pos.pnl = -pos.cost;
+            pos.status = "lost";
+            this.state.losses++;
+            this.log(
+              `  LOST ${this.bracketLabel(b)} → -$${pos.cost.toFixed(2)}`,
+              "red"
+            );
+          }
+
+          pos.resolvedAt = new Date().toISOString();
+          // Find the winning bracket to record as "actual temp" for display
+          const winningTicker = [...kalshiResults.entries()].find(([_, r]) => r === "yes")?.[0];
+          const winBracket = winningTicker ? market.brackets.find(br => (br as any).slug === winningTicker) : null;
+          if (winBracket) {
+            const lo = winBracket.lowF, hi = winBracket.highF;
+            pos.resolvedTempF = (lo != null && isFinite(lo)) && (hi != null && isFinite(hi))
+              ? Math.round((lo + hi) / 2)
+              : (lo != null && isFinite(lo)) ? lo : hi;
+          }
+          this.state.deployed -= pos.cost;
+          this.state.totalPnl += pos.pnl;
+          ladderPnl += pos.pnl;
+          legsResolvedThisLadder++;
+
+          this.logTrade(pos.status === "won" ? "WON" : "LOST", pos);
+          this.onPositionClosed?.(pos);
+
+          resolved.push(pos);
+        }
+
+        if (legsResolvedThisLadder > 0) {
+          const ladderColor = ladderPnl >= 0 ? "green" : "red";
+          this.log(
+            `  LADDER NET: ${ladderPnl >= 0 ? "+" : ""}$${ladderPnl.toFixed(2)} ` +
+            `(${positions.filter(p => p.status === "won").length} hit / ${legsResolvedThisLadder} legs resolved)`,
+            ladderColor
+          );
+
+          // Mark this market as resolved if ALL legs resolved
+          const allDone = positions.every(p => p.status !== "open");
+          if (allDone) {
+            const resolvedKey = `${market.city.toLowerCase()}-${market.date}-${market.type}`;
+            this.resolvedMarketKeys.add(resolvedKey);
+            this.activeLadderKeys.add(resolvedKey);
+          }
+        }
+        continue; // skip legacy tempF path
+      }
+
+      // Tier 2 (fallback): Open-Meteo archive / METAR. Only used when Kalshi hasn't
+      // yet finalized the market (rare — Kalshi usually finalizes within hours of close).
       const actual = await this.fetchActualTemp(market.city, market.date, market.type);
 
       if (!actual) {
-        // Data not available yet — keep positions open, will retry next scan
         this.log(
           `PENDING ${market.city} ${market.date} (${market.type}) — ` +
-          `actual temp not yet available, will retry next scan`,
+          `Kalshi not finalized AND fallback data unavailable, will retry next scan`,
           "yellow"
         );
         continue;
@@ -955,7 +1136,7 @@ export class WeatherSimulator {
       const ladderCost = positions.reduce((s, p) => s + p.cost, 0);
       this.log(
         `RESOLVING ${market.city} ${market.date} (${market.type}) — ` +
-        `Actual: ${actualTempF}°F [${actual.source}] ` +
+        `Actual: ${actualTempF}°F [${actual.source} fallback, Kalshi not yet finalized] ` +
         `(${positions.length} legs, $${ladderCost.toFixed(2)} deployed)`,
         "magenta"
       );
@@ -969,7 +1150,6 @@ export class WeatherSimulator {
         const inBracket = actualTempF >= lo && actualTempF <= hi;
 
         if (inBracket) {
-          // Kalshi charges 7% on net winnings (payout − stake), losses are fee-free
           const payout = pos.shares * 1.0;
           const fee = kalshiFee(pos.shares, pos.entryPrice, true);
           pos.pnl = payout - pos.cost - fee;
@@ -1010,7 +1190,7 @@ export class WeatherSimulator {
       // Mark this market as resolved — NEVER re-buy it
       const resolvedKey = `${market.city.toLowerCase()}-${market.date}-${market.type}`;
       this.resolvedMarketKeys.add(resolvedKey);
-      this.activeLadderKeys.add(resolvedKey); // also ensure active set has it
+      this.activeLadderKeys.add(resolvedKey);
 
       resolved.push(...positions);
     }
@@ -1018,10 +1198,144 @@ export class WeatherSimulator {
     if (resolved.length === 0) return;
 
     // Move only resolved positions to closed (keep pending ones open)
-    this.state.closedPositions.push(...resolved);
+    // Filter duplicates — Kalshi path already called resolved.push() per-leg
+    const resolvedIds = new Set(resolved.map(p => p.id));
+    const alreadyClosed = new Set(this.state.closedPositions.map(p => p.id));
+    const toAdd = resolved.filter(p => !alreadyClosed.has(p.id));
+    this.state.closedPositions.push(...toAdd);
     this.state.positions = this.state.positions.filter(p => p.status === "open");
     this.saveState();
     this.onDashboardUpdate?.();
+  }
+
+  /**
+   * Re-derive state counters from the positions arrays (source of truth).
+   * Used to correct drift from accounting bugs (e.g. missed balance deductions).
+   *
+   * Invariants enforced:
+   *   deployed  = sum of open.cost
+   *   totalPnl  = sum of closed.pnl
+   *   wins      = count of closed where status='won'
+   *   losses    = count of closed where status='lost'
+   *   balance   = startingBalance + totalPnl - deployed
+   *               (derived from invariant: equity = start + realized_pnl)
+   */
+  reconcileState(): { changes: Record<string, [number, number]> } {
+    const before = {
+      balance: this.state.balance,
+      deployed: this.state.deployed,
+      totalPnl: this.state.totalPnl,
+      wins: this.state.wins,
+      losses: this.state.losses,
+    };
+
+    const derivedDeployed = this.state.positions.reduce((s, p) => s + p.cost, 0);
+    const derivedTotalPnl = this.state.closedPositions.reduce((s, p) => s + p.pnl, 0);
+    const derivedWins = this.state.closedPositions.filter(p => p.status === "won").length;
+    const derivedLosses = this.state.closedPositions.filter(p => p.status === "lost").length;
+    const derivedBalance = this.config.startingBalance + derivedTotalPnl - derivedDeployed;
+
+    this.state.deployed = Math.round(derivedDeployed * 100) / 100;
+    this.state.totalPnl = Math.round(derivedTotalPnl * 100) / 100;
+    this.state.wins = derivedWins;
+    this.state.losses = derivedLosses;
+    this.state.balance = Math.round(derivedBalance * 100) / 100;
+
+    const changes: Record<string, [number, number]> = {};
+    for (const k of Object.keys(before) as Array<keyof typeof before>) {
+      const b = (before as any)[k];
+      const a = (this.state as any)[k];
+      if (Math.abs(b - a) > 0.01) changes[k] = [b, a];
+    }
+    return { changes };
+  }
+
+  /**
+   * One-time audit: re-check closed positions against Kalshi's official result.
+   * If a position was wrongly resolved (e.g. METAR said WON but Kalshi said NO),
+   * correct the status, pnl, balance, and win/loss counters.
+   */
+  async auditClosedPositions() {
+    if (!this.state.closedPositions || this.state.closedPositions.length === 0) return;
+    const client = new KalshiClient({ demo: false });
+    const byEvent = new Map<string, WeatherPosition[]>();
+    for (const pos of this.state.closedPositions) {
+      const key = pos.market.eventId;
+      if (!byEvent.has(key)) byEvent.set(key, []);
+      byEvent.get(key)!.push(pos);
+    }
+
+    let corrected = 0;
+    for (const [eventTicker, positions] of byEvent) {
+      try {
+        const res = await client.getMarkets({ event_ticker: eventTicker, limit: 100 });
+        const kalshiResults = new Map<string, "yes" | "no" | null>();
+        for (const m of res.markets ?? []) {
+          const r = (m as any).result;
+          const status = ((m as any).status || "").toLowerCase();
+          if (status === "finalized" && (r === "yes" || r === "no")) {
+            kalshiResults.set(m.ticker, r);
+          }
+        }
+
+        if (kalshiResults.size === 0) continue;
+
+        for (const pos of positions) {
+          const ticker = (pos.bracket as any).slug || (pos.bracket as any).conditionId;
+          const kalshiResult = kalshiResults.get(ticker);
+          if (kalshiResult == null) continue;
+
+          const currentStatus = pos.status;
+          const kalshiStatus = kalshiResult === "yes" ? "won" : "lost";
+          if (currentStatus === kalshiStatus) continue;
+
+          // MISMATCH — correct it
+          this.log(
+            `AUDIT CORRECTION: ${pos.market.city} ${pos.market.date} ${this.bracketLabel(pos.bracket)} — ` +
+            `had ${currentStatus}, Kalshi says ${kalshiStatus}`,
+            "yellow"
+          );
+
+          // Reverse old effect on state
+          if (currentStatus === "won") {
+            // balance had: +payout - fee added. Reverse it.
+            const oldPayout = pos.shares * 1.0;
+            const oldFee = kalshiFee(pos.shares, pos.entryPrice, true);
+            this.state.balance -= oldPayout - oldFee;
+            this.state.wins--;
+          } else if (currentStatus === "lost") {
+            // balance had: no change (stake was deducted at entry). Nothing to reverse.
+            this.state.losses--;
+          }
+          // Reverse the pnl impact on totalPnl
+          this.state.totalPnl -= pos.pnl;
+
+          // Apply new (correct) effect
+          if (kalshiStatus === "won") {
+            const payout = pos.shares * 1.0;
+            const fee = kalshiFee(pos.shares, pos.entryPrice, true);
+            pos.pnl = payout - pos.cost - fee;
+            pos.status = "won";
+            this.state.balance += payout - fee;
+            this.state.wins++;
+          } else {
+            pos.pnl = -pos.cost;
+            pos.status = "lost";
+            this.state.losses++;
+          }
+          this.state.totalPnl += pos.pnl;
+          corrected++;
+        }
+      } catch (err) {
+        this.log(`Audit failed for ${eventTicker}: ${err}`, "yellow");
+      }
+    }
+
+    if (corrected > 0) {
+      this.log(`AUDIT COMPLETE: ${corrected} position(s) corrected`, "cyan");
+      this.saveState();
+      this.onDashboardUpdate?.();
+    }
   }
 
   // ─── Manual trigger for testing ──────────────────────────────────
