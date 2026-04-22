@@ -30,7 +30,7 @@ console.log("");
 for (const e of evs) {
   const strikeTs = e.strike_date ? Date.parse(e.strike_date) / 1000 : 0;
   const mkts = e.markets ?? [];
-  const active = mkts.filter((m) => m.status === "active" || m.status === "open").length;
+  const active = mkts.filter((m) => m.status === "active" || (m.status as string) === "open").length;
   console.log(
     `  ${e.event_ticker.padEnd(28)} ${e.series_ticker.padEnd(10)} ` +
     `strike=${e.strike_date ?? "—"} (${strikeTs ? fmt(strikeTs) : "—"})  ` +
