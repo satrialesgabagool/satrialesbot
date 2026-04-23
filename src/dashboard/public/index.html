@@ -192,8 +192,10 @@ td.num { text-align: right; }
       <label>Sort
         <select id="pos-sort">
           <option value="closes">Closes soonest</option>
-          <option value="pnl-desc">P&amp;L ↓</option>
-          <option value="pnl-asc">P&amp;L ↑</option>
+          <option value="ev-desc">Expected P&amp;L ↓</option>
+          <option value="ev-asc">Expected P&amp;L ↑</option>
+          <option value="pnl-desc">Unreal. P&amp;L ↓</option>
+          <option value="pnl-asc">Unreal. P&amp;L ↑</option>
           <option value="exposure">Exposure</option>
         </select>
       </label>
@@ -201,6 +203,15 @@ td.num { text-align: right; }
   </header>
   <div id="positions-summary"></div>
   <div id="positions-body"></div>
+</section>
+
+<!-- Forecast coverage on open positions -->
+<section>
+  <header>
+    <h2>Forecast coverage on open positions <span class="count" id="coverage-count">—</span></h2>
+    <span class="dim" style="font-size:11px">Current 82-member GFS+ECMWF ensemble re-run every refresh</span>
+  </header>
+  <div id="coverage-body"></div>
 </section>
 
 <!-- Resting orders -->
@@ -377,6 +388,11 @@ function renderTopCards() {
       <div class="value">${wr == null ? '—' : fmt.pct0(wr)}</div>
       <div class="sub">${totalWins}W · ${totalLosses}L · realized ${fmt.moneyPos(totalRealized)}</div>
     </div>
+    <div class="card">
+      <div class="label">Expected P&amp;L (model)</div>
+      <div class="value ${pnlClass(app.positionsSummary?.totalExpectedValueUSD)}">${fmt.moneyPos(app.positionsSummary?.totalExpectedValueUSD ?? null)}</div>
+      <div class="sub">${app.positionsSummary?.positionsWithForecast ?? 0}/${app.positions.length} positions priced by 82-member ensemble${app.positionsSummary?.avgModelProb != null ? ' · avg prob '+fmt.pct0(app.positionsSummary.avgModelProb) : ''}</div>
+    </div>
   `;
 }
 
@@ -540,6 +556,8 @@ function renderPositions() {
   if (cityFilter) pos = pos.filter(p => (p.city ?? '').toLowerCase().includes(cityFilter));
   if (sideFilter !== 'all') pos = pos.filter(p => p.side === sideFilter);
   if (sort === 'closes') pos.sort((a,b) => (a.hoursToClose ?? 999) - (b.hoursToClose ?? 999));
+  else if (sort === 'ev-desc') pos.sort((a,b) => (b.expectedValueUSD ?? -9999) - (a.expectedValueUSD ?? -9999));
+  else if (sort === 'ev-asc') pos.sort((a,b) => (a.expectedValueUSD ?? 9999) - (b.expectedValueUSD ?? 9999));
   else if (sort === 'pnl-desc') pos.sort((a,b) => (b.unrealizedPnlUSD ?? 0) - (a.unrealizedPnlUSD ?? 0));
   else if (sort === 'pnl-asc') pos.sort((a,b) => (a.unrealizedPnlUSD ?? 0) - (b.unrealizedPnlUSD ?? 0));
   else if (sort === 'exposure') pos.sort((a,b) => (b.exposureUSD ?? 0) - (a.exposureUSD ?? 0));
@@ -565,7 +583,11 @@ function renderPositions() {
 
   if (pos.length === 0) { el.innerHTML = '<div class="empty">No positions match these filters</div>'; return; }
 
-  const rows = pos.map(p => `
+  const rows = pos.map(p => {
+    // Effective model prob — if side is NO, the winning prob is 1 - bracketHitProb
+    const winProb = p.modelProb == null ? null : (p.side === 'yes' ? p.modelProb : 1 - p.modelProb);
+    const evClass = p.expectedValueUSD == null ? 'dim' : pnlClass(p.expectedValueUSD);
+    return `
     <tr>
       <td>${attributionTag(p)}</td>
       <td><code style="font-size:11px">${p.ticker}</code></td>
@@ -577,20 +599,131 @@ function renderPositions() {
       <td class="num">$${p.markPrice.toFixed(3)}</td>
       <td class="num">${fmt.money(p.exposureUSD)}</td>
       <td class="num ${pnlClass(p.unrealizedPnlUSD)}">${fmt.moneyPos(p.unrealizedPnlUSD)}</td>
+      <td class="num ${winProb == null ? 'dim' : ''}">${winProb == null ? '—' : fmt.pct0(winProb)}</td>
+      <td class="num ${evClass}">${fmt.moneyPos(p.expectedValueUSD ?? null)}</td>
       <td class="num dim">${fmt.hours(p.hoursToClose)}</td>
     </tr>
-  `).join('');
+  `;}).join('');
 
   el.innerHTML = `
     <table>
       <thead><tr>
         <th>Bot</th><th>Ticker</th><th>City</th><th>Bracket</th><th>Side</th>
         <th class="num">Shares</th><th class="num">Avg</th><th class="num">Mark</th>
-        <th class="num">Cost</th><th class="num">Unreal. P&amp;L</th><th class="num">Closes</th>
+        <th class="num">Cost</th><th class="num">Unreal.</th>
+        <th class="num" title="Model probability this position wins">Win prob</th>
+        <th class="num" title="Expected P&L on resolution, net of Kalshi 7% winnings fee">Exp. P&amp;L</th>
+        <th class="num">Closes</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
+}
+
+// ─── Forecast coverage on open positions ─────────────────────────────
+// One card per (city, date) that we have positions on. Each card shows:
+//   - Ensemble mean ± stddev (with p10-p90 range)
+//   - Every position we hold on that market, with modelProb + winProb + EV
+//   - A small bar indicating whether the ensemble mean falls INSIDE our bracket
+function renderCoverage() {
+  const el = document.getElementById('coverage-body');
+  const countEl = document.getElementById('coverage-count');
+  const withForecast = app.positions.filter(p => p.forecast && p.modelProb != null);
+
+  if (withForecast.length === 0) {
+    countEl.textContent = '';
+    el.innerHTML = '<div class="empty">No open positions with forecast data</div>';
+    return;
+  }
+
+  // Group by eventTicker (= one Kalshi market event = one (city, date) pair)
+  const groups = new Map();
+  for (const p of withForecast) {
+    const key = p.eventTicker || (p.city + '-' + (p.closeTime ?? ''));
+    if (!groups.has(key)) {
+      groups.set(key, {
+        eventTicker: p.eventTicker,
+        city: p.city,
+        closeTime: p.closeTime,
+        hoursToClose: p.hoursToClose,
+        forecast: p.forecast, // same ensemble for all positions in this event
+        positions: [],
+      });
+    }
+    groups.get(key).positions.push(p);
+  }
+
+  countEl.textContent = `(${groups.size} market${groups.size === 1 ? '' : 's'})`;
+
+  const cards = [];
+  const groupArr = Array.from(groups.values()).sort((a, b) => (a.hoursToClose ?? 999) - (b.hoursToClose ?? 999));
+
+  for (const g of groupArr) {
+    const f = g.forecast;
+    const totalExp = g.positions.reduce((s, p) => s + (p.exposureUSD ?? 0), 0);
+    const totalEV = g.positions.reduce((s, p) => s + (p.expectedValueUSD ?? 0), 0);
+
+    // Ranges for the forecast bar (use p10-p90 as visual extent)
+    const lo = Math.min(f.p10 - 1, ...g.positions.map(p => p.bracketRange?.lowF ?? f.p10).filter(isFinite));
+    const hi = Math.max(f.p90 + 1, ...g.positions.map(p => p.bracketRange?.highF ?? f.p90).filter(isFinite));
+    const span = Math.max(1, hi - lo);
+    const pct = v => Math.max(0, Math.min(100, ((v - lo) / span) * 100));
+
+    const posRows = g.positions.map(p => {
+      const win = p.side === 'yes' ? p.modelProb : 1 - p.modelProb;
+      const r = p.bracketRange;
+      const inBracket = r && f.mean >= (r.lowF ?? -Infinity) && f.mean <= (r.highF ?? Infinity);
+      const barStyle = r
+        ? `position:absolute;top:0;height:100%;left:${pct(isFinite(r.lowF) ? r.lowF : lo)}%;width:${pct(isFinite(r.highF) ? r.highF : hi) - pct(isFinite(r.lowF) ? r.lowF : lo)}%;background:${inBracket ? 'rgba(46,204,113,0.22)' : 'rgba(243,156,18,0.18)'};border:1px solid ${inBracket ? 'rgba(46,204,113,0.5)' : 'rgba(243,156,18,0.45)'};border-radius:3px`
+        : '';
+      return `
+        <tr>
+          <td>${attributionTag(p)}</td>
+          <td><span class="bracket">${p.bracketText || '—'}</span> ${sideTag(p.side)}</td>
+          <td class="num">${p.shares.toFixed(0)}sh @ $${p.avgEntryPrice.toFixed(3)}</td>
+          <td class="num">${fmt.pct0(win)}</td>
+          <td class="num ${pnlClass(p.expectedValueUSD)}">${fmt.moneyPos(p.expectedValueUSD)}</td>
+          <td>
+            <div style="position:relative;height:14px;background:var(--bg-input);border-radius:3px;border:1px solid var(--border);overflow:hidden">
+              <div style="${barStyle}"></div>
+              <div title="ensemble mean" style="position:absolute;top:0;height:100%;left:calc(${pct(f.mean)}% - 1px);width:2px;background:#4c7dff"></div>
+              <div title="p10" style="position:absolute;top:3px;height:8px;left:calc(${pct(f.p10)}% - 0.5px);width:1px;background:rgba(76,125,255,0.4)"></div>
+              <div title="p90" style="position:absolute;top:3px;height:8px;left:calc(${pct(f.p90)}% - 0.5px);width:1px;background:rgba(76,125,255,0.4)"></div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    cards.push(`
+      <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:10px;background:var(--bg-elev)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+          <div>
+            <div style="font-size:13px;font-weight:600">${g.city ?? '?'} <span class="dim" style="font-weight:400;font-size:12px">· ${g.eventTicker ?? ''}</span></div>
+            <div class="dim" style="font-size:11px;margin-top:2px">Closes ${fmt.iso2local(g.closeTime)} · ${fmt.hours(g.hoursToClose)} away</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:13px"><span class="cyan">${fmt.temp(f.mean)}</span> <span class="dim">±${f.stddev.toFixed(1)}°</span></div>
+            <div class="dim" style="font-size:11px">p10 ${fmt.temp(f.p10)} · p90 ${fmt.temp(f.p90)}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="dim" style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Total</div>
+            <div style="font-size:13px">${fmt.money(totalExp)} in · <span class="${pnlClass(totalEV)}">${fmt.moneyPos(totalEV)}</span> EV</div>
+          </div>
+        </div>
+        <table style="font-size:12px">
+          <thead><tr>
+            <th></th><th>Bracket</th><th class="num">Shares @ entry</th>
+            <th class="num">Win prob</th><th class="num">Exp. P&amp;L</th>
+            <th style="width:35%">Forecast (blue=ensemble · green=in bracket · amber=outside)</th>
+          </tr></thead>
+          <tbody>${posRows}</tbody>
+        </table>
+      </div>
+    `);
+  }
+
+  el.innerHTML = cards.join('');
 }
 
 // ─── Orders table ─────────────────────────────────────────────────────
@@ -795,6 +928,7 @@ async function refreshAll() {
   renderTopCards();
   renderBotRow();
   renderPositions();
+  renderCoverage();
   renderOrders();
   renderEquity();
 }

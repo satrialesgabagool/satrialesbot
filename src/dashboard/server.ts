@@ -143,6 +143,65 @@ function hoursToClose(iso: string | undefined): number {
   return Math.max(0, (new Date(iso).getTime() - Date.now()) / 3600000);
 }
 
+// ─── Helpers for forecast-aware position enrichment ───────────────────
+
+/** Parse "KXHIGHNY-26APR23" → { citySeries: "NY", dateIso: "2026-04-23" }. */
+function parseEventTicker(eventTicker: string | null): { citySeries: string; dateIso: string } | null {
+  if (!eventTicker) return null;
+  const m = eventTicker.match(/^KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})$/);
+  if (!m) return null;
+  const [, city, yy, monAbbr, dd] = m;
+  const MONTHS: Record<string, string> = {
+    JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12",
+  };
+  const mm = MONTHS[monAbbr];
+  if (!mm) return null;
+  return { citySeries: city, dateIso: `20${yy}-${mm}-${dd}` };
+}
+
+/** Extract bracket temperature range from Kalshi market strike info. */
+function bracketFromKalshiMarket(m: any): { lowF: number; highF: number } | null {
+  if (!m) return null;
+  const floor = typeof m.floor_strike === "number" ? m.floor_strike : null;
+  const cap = typeof m.cap_strike === "number" ? m.cap_strike : null;
+  const type = m.strike_type;
+  if (type === "less" || type === "less_or_equal") {
+    if (cap == null) return null;
+    return { lowF: -Infinity, highF: cap };
+  }
+  if (type === "greater" || type === "greater_or_equal") {
+    if (floor == null) return null;
+    return { lowF: floor, highF: Infinity };
+  }
+  if (type === "between" || type === "structured" || type === "custom") {
+    if (floor == null || cap == null) return null;
+    return { lowF: floor, highF: cap };
+  }
+  // Fallback: if we have both strikes, assume interval
+  if (floor != null && cap != null) return { lowF: floor, highF: cap };
+  if (cap != null) return { lowF: -Infinity, highF: cap };
+  if (floor != null) return { lowF: floor, highF: Infinity };
+  return null;
+}
+
+/**
+ * Expected value per share, net of Kalshi's 7% fee on winnings.
+ *
+ *   If position wins (prob = modelProb), payoff = $1 gross.
+ *   Winnings = $1 - entry. Fee = 0.07 × winnings.
+ *   Net receipt on win = $1 - 0.07 × (1 - entry) = 0.93 + 0.07 × entry
+ *   Gain on win = 0.93 + 0.07 × entry - entry = 0.93 × (1 - entry)
+ *
+ *   If position loses (prob = 1 - modelProb), gain = -entry.
+ *
+ *   EV_per_share = modelProb × 0.93 × (1 - entry) - (1 - modelProb) × entry
+ */
+const KALSHI_WINNINGS_FEE = 0.07;
+function expectedValuePerShare(modelProb: number, entryPrice: number): number {
+  const p = Math.max(0, Math.min(1, modelProb));
+  return p * (1 - KALSHI_WINNINGS_FEE) * (1 - entryPrice) - (1 - p) * entryPrice;
+}
+
 // ─── Trade CSV parser ─────────────────────────────────────────────────
 
 interface TradeRow {
@@ -378,6 +437,23 @@ app.get("/api/positions", async (c) => {
       // Build the per-bot managed-ticker sets once (avoids re-reading state files N times)
       const managed = buildManagedTickerSets();
 
+      // Pre-fetch ensemble forecasts for every unique city with a position.
+      // One API call per city gives us up to 7 days of members; we match by date.
+      const uniqueCities = Array.from(new Set(
+        open.map(p => {
+          const parsed = parseEventTicker(marketByTicker.get(p.ticker)?.event_ticker ?? null);
+          return parsed?.citySeries;
+        }).filter((x): x is string => !!x)
+      ));
+      const ensembleByCity: Record<string, any> = {};
+      await Promise.all(uniqueCities.map(async city => {
+        try {
+          ensembleByCity[city] = await cached(`ensemble:${city}:7d`, 10 * 60_000, () => fetchGFSEnsemble(city, 7));
+        } catch {
+          ensembleByCity[city] = null;
+        }
+      }));
+
       const positions = open.map(p => {
         const posShares = parseFloat(p.position_fp);
         const side: "yes" | "no" = posShares >= 0 ? "yes" : "no";
@@ -401,6 +477,39 @@ app.get("/api/positions", async (c) => {
 
         const { bot, orphanHint } = classifyPosition(p.ticker, avgEntryPrice, managed);
 
+        // Forecast enrichment: match this position's date against the ensemble
+        // for its city, compute our bracket probability + expected value.
+        const parsedTicker = parseEventTicker(m?.event_ticker ?? null);
+        const ensemble = parsedTicker ? ensembleByCity[parsedTicker.citySeries] : null;
+        const day = ensemble?.days?.find((d: any) => d.date === parsedTicker?.dateIso) ?? null;
+        const members: number[] = day?.highF_members ?? [];
+        const bracketRange = bracketFromKalshiMarket(m);
+
+        let modelProb: number | null = null;
+        let forecastStats: { mean: number; stddev: number; p10: number; median: number; p90: number } | null = null;
+        let expectedValueUSD: number | null = null;
+        let expectedValuePerShareUSD: number | null = null;
+
+        if (members.length >= 10) {
+          const sorted = [...members].sort((a, b) => a - b);
+          const mean = members.reduce((a, b) => a + b, 0) / members.length;
+          const variance = members.reduce((a, b) => a + (b - mean) ** 2, 0) / members.length;
+          forecastStats = {
+            mean,
+            stddev: Math.sqrt(variance),
+            p10: sorted[Math.floor(sorted.length * 0.1)],
+            median: sorted[Math.floor(sorted.length * 0.5)],
+            p90: sorted[Math.floor(sorted.length * 0.9)],
+          };
+          if (bracketRange) {
+            modelProb = empiricalBracketProbability(members, bracketRange.lowF, bracketRange.highF);
+            // Side-adjust: if we're short YES (i.e. holding NO), our payoff probability is 1 - modelProb.
+            const winProb = side === "yes" ? modelProb : 1 - modelProb;
+            expectedValuePerShareUSD = expectedValuePerShare(winProb, avgEntryPrice);
+            expectedValueUSD = +(shares * expectedValuePerShareUSD).toFixed(4);
+          }
+        }
+
         return {
           ticker: p.ticker,
           eventTicker: m?.event_ticker ?? null,
@@ -408,6 +517,7 @@ app.get("/api/positions", async (c) => {
           orphanHint: orphanHint ?? null,
           city,
           bracketText,
+          bracketRange,
           side,
           shares,
           avgEntryPrice,
@@ -421,9 +531,15 @@ app.get("/api/positions", async (c) => {
           hoursToClose: hoursToClose(m?.close_time),
           status: m?.status ?? "unknown",
           restingOrdersCount: p.resting_orders_count ?? 0,
+          // Forecast-aware fields (null if we couldn't pull an ensemble for this market)
+          modelProb,
+          expectedValuePerShareUSD,
+          expectedValueUSD,
+          forecast: forecastStats,
         };
       });
 
+      const withEV = positions.filter(p => p.expectedValueUSD != null);
       const summary = {
         managed: positions.filter(p => p.bot === "intrinsic" || p.bot === "ensemble").length,
         intrinsic: positions.filter(p => p.bot === "intrinsic").length,
@@ -432,6 +548,14 @@ app.get("/api/positions", async (c) => {
         external: positions.filter(p => p.bot === "external").length,
         orphanExposureUSD: +positions.filter(p => p.bot === "orphan").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
         externalExposureUSD: +positions.filter(p => p.bot === "external").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
+        // Expected P&L across positions with forecast coverage
+        totalExpectedValueUSD: +withEV.reduce((s, p) => s + (p.expectedValueUSD ?? 0), 0).toFixed(2),
+        positionsWithForecast: withEV.length,
+        // Optional: weighted model win-prob (capital-weighted)
+        avgModelProb: withEV.length
+          ? +(withEV.reduce((s, p) => s + (p.modelProb ?? 0) * p.exposureUSD, 0) /
+             Math.max(0.01, withEV.reduce((s, p) => s + p.exposureUSD, 0))).toFixed(4)
+          : null,
       };
 
       return { configured: true, positions, summary };
