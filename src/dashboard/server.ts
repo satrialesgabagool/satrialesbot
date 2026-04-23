@@ -26,6 +26,7 @@ import { KalshiClient } from "../kalshi/KalshiClient";
 import { loadCredentialsFromEnv } from "../kalshi/KalshiAuth";
 import { fetchGFSEnsemble, empiricalBracketProbability } from "../weather/GFSEnsemble";
 import { findKalshiWeatherMarkets, KALSHI_WEATHER_CITIES } from "../kalshi/KalshiWeatherFinder";
+import { createEquityLogger } from "./KalshiEquityLogger";
 
 // Short-code → full Kalshi city name, derived from the canonical finder table.
 // Short code is the segment after "KXHIGH" in the series ticker.
@@ -65,6 +66,12 @@ const BOTS = {
 
 type BotKey = keyof typeof BOTS;
 const BOT_KEYS = Object.keys(BOTS) as BotKey[];
+
+// Ground-truth Kalshi equity snapshots — appended every 10 min while the
+// dashboard is running. Survives bot restarts since it reads the actual
+// Kalshi account rather than per-bot sim state.
+const EQUITY_SNAPSHOTS_CSV = join(ROOT, "results/kalshi-equity-snapshots.csv");
+const EQUITY_SNAPSHOT_INTERVAL_MS = 10 * 60_000;
 
 // ─── Kalshi client (lazy singleton) ───────────────────────────────────
 
@@ -559,17 +566,57 @@ app.get("/api/trades", (c) => {
   return c.json({ trades, total: trades.length });
 });
 
-// ─── Equity curve (one series per bot) ────────────────────────────────
+// ─── Equity curve ─────────────────────────────────────────────────────
+// Returns THREE series so the UI can toggle what it shows:
+//   1. kalshi        — ground-truth account value over time (logged by this
+//                      server every ~10 min while running)
+//   2. intrinsicPnl  — cumulative realized P&L from the intrinsic bot's CSV
+//   3. ensemblePnl   — cumulative realized P&L from the ensemble bot's CSV
+//   4. combinedPnl   — combined cumulative P&L across both bots (merged by time)
+//
+// Cumulative P&L is computed by summing the `pnl` column row-by-row. Since
+// pnl is a per-trade realized figure (independent of the simulator's
+// internal balance), this stitches cleanly across --fresh restarts.
+
+function cumulativePnlFromCsv(path: string, bot: BotKey): Array<{ t: string; value: number }> {
+  const rows = parseCsv(path, bot);
+  rows.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  let acc = 0;
+  return rows.map(r => {
+    acc += r.pnl;
+    return { t: r.timestamp, value: +acc.toFixed(4) };
+  });
+}
 
 app.get("/api/equity", (c) => {
-  const series: Record<string, Array<{ t: string; balance: number }>> = {};
-  for (const key of BOT_KEYS) {
-    const rows = parseCsv(BOTS[key].tradesPath, key);
-    series[key] = rows
-      .filter(r => r.balance > 0)
-      .map(r => ({ t: r.timestamp, balance: r.balance }));
-  }
-  return c.json({ series });
+  const intrinsicPnl = cumulativePnlFromCsv(BOTS.intrinsic.tradesPath, "intrinsic");
+  const ensemblePnl = cumulativePnlFromCsv(BOTS.ensemble.tradesPath, "ensemble");
+
+  // Combined: merge both bots by timestamp, carry forward each bot's running total
+  const allEvents = [
+    ...intrinsicPnl.map(p => ({ t: p.t, bot: "intrinsic" as const, value: p.value })),
+    ...ensemblePnl.map(p => ({ t: p.t, bot: "ensemble" as const, value: p.value })),
+  ].sort((a, b) => a.t.localeCompare(b.t));
+  let iLast = 0, eLast = 0;
+  const combinedPnl = allEvents.map(ev => {
+    if (ev.bot === "intrinsic") iLast = ev.value;
+    else eLast = ev.value;
+    return { t: ev.t, value: +(iLast + eLast).toFixed(4) };
+  });
+
+  const kalshiSnapshots = equityLogger?.readSeries() ?? [];
+  const kalshi = kalshiSnapshots.map(s => ({
+    t: s.t,
+    cashUSD: s.cashUSD,
+    portfolioValueUSD: s.portfolioValueUSD,
+  }));
+
+  return c.json({
+    kalshi,              // ground-truth
+    intrinsicPnl,        // per-bot cumulative realized
+    ensemblePnl,
+    combinedPnl,         // both bots summed
+  });
 });
 
 // ─── Health / root summary ────────────────────────────────────────────
@@ -631,6 +678,16 @@ app.use("/*", serveStatic({ root: "./src/dashboard/public" }));
 // ─── Boot ─────────────────────────────────────────────────────────────
 
 getKalshi(); // warm singleton so kalshiAvailable is accurate
+
+// Ground-truth equity logger — writes a CSV of Kalshi balance snapshots.
+// No-ops silently if Kalshi isn't configured.
+const equityLogger = createEquityLogger({
+  client: kalshiClient,
+  csvPath: EQUITY_SNAPSHOTS_CSV,
+  intervalMs: EQUITY_SNAPSHOT_INTERVAL_MS,
+  log: (msg) => console.log(`  [equity-logger] ${msg}`),
+});
+equityLogger.start();
 
 console.log(`
   ╔══════════════════════════════════════════════╗

@@ -239,13 +239,20 @@ td.num { text-align: right; }
 <!-- Equity curve -->
 <section>
   <header>
-    <h2>Equity curve (per bot)</h2>
-    <div class="legend">
-      <span><span class="sw" style="background:#4c7dff"></span>Intrinsic</span>
-      <span><span class="sw" style="background:#9b59b6"></span>Ensemble</span>
+    <h2>Equity curve <span class="count" id="equity-hint"></span></h2>
+    <div class="filters">
+      <label>View
+        <select id="eq-view">
+          <option value="kalshi">Kalshi account (live)</option>
+          <option value="pnl-combined">Cumulative P&amp;L (both bots)</option>
+          <option value="pnl-per-bot">Cumulative P&amp;L (per bot)</option>
+        </select>
+      </label>
     </div>
   </header>
+  <div class="legend" id="equity-legend" style="margin-bottom:8px"></div>
   <div id="equity-wrap"><canvas id="equity-chart"></canvas></div>
+  <div class="dim" id="equity-caption" style="font-size:11px;margin-top:8px"></div>
 </section>
 
 <script>
@@ -622,40 +629,76 @@ function renderTrades() {
 }
 
 // ─── Equity chart ─────────────────────────────────────────────────────
+// Three views:
+//   "kalshi"      — ground-truth Kalshi account value (cash + portfolio)
+//   "pnl-combined"— cumulative realized P&L across both bots
+//   "pnl-per-bot" — cumulative realized P&L, one line per bot
 function renderEquity() {
-  const ctx = document.getElementById('equity-chart').getContext('2d');
-  const s = app.equity?.series ?? {};
-  const datasets = [];
-  if (s.intrinsic?.length) {
-    datasets.push({
-      label: 'Intrinsic',
-      data: s.intrinsic.map(p => ({ x: new Date(p.t), y: p.balance })),
-      borderColor: '#4c7dff',
-      backgroundColor: 'rgba(76,125,255,0.08)',
-      fill: false, tension: 0.2, pointRadius: 0, borderWidth: 2,
-    });
-  }
-  if (s.ensemble?.length) {
-    datasets.push({
-      label: 'Ensemble',
-      data: s.ensemble.map(p => ({ x: new Date(p.t), y: p.balance })),
-      borderColor: '#9b59b6',
-      backgroundColor: 'rgba(155,89,182,0.08)',
-      fill: false, tension: 0.2, pointRadius: 0, borderWidth: 2,
-    });
+  const view = document.getElementById('eq-view').value;
+  const wrap = document.getElementById('equity-wrap');
+  const legend = document.getElementById('equity-legend');
+  const caption = document.getElementById('equity-caption');
+  const hint = document.getElementById('equity-hint');
+  const e = app.equity ?? {};
+
+  let datasets = [], legendHtml = '', captionText = '', hintText = '', yFormat = v => '$' + v.toFixed(0);
+
+  if (view === 'kalshi') {
+    const k = e.kalshi ?? [];
+    if (k.length === 0) {
+      wrap.innerHTML = `<div class="empty">No Kalshi snapshots yet.<br>Dashboard logs one every ~10 min — leave it running and check back.</div>`;
+      legend.innerHTML = ''; caption.textContent = ''; hint.textContent = '';
+      if (app.equityChart) { app.equityChart.destroy(); app.equityChart = null; }
+      return;
+    }
+    datasets = [
+      { label: 'Portfolio value', data: k.map(p => ({ x: new Date(p.t), y: p.portfolioValueUSD })),
+        borderColor: '#2ecc71', backgroundColor: 'rgba(46,204,113,0.10)', fill: true, tension: 0.15, pointRadius: 0, borderWidth: 2 },
+      { label: 'Cash', data: k.map(p => ({ x: new Date(p.t), y: p.cashUSD })),
+        borderColor: '#3ab7d4', backgroundColor: 'rgba(58,183,212,0.06)', fill: false, tension: 0.15, pointRadius: 0, borderWidth: 1.5, borderDash: [4,3] },
+    ];
+    legendHtml = `<span><span class="sw" style="background:#2ecc71"></span>Portfolio value</span><span><span class="sw" style="background:#3ab7d4"></span>Cash</span>`;
+    captionText = `Ground-truth Kalshi account value — logged every 10 min by this dashboard while running.`;
+    hintText = `${k.length} snapshot${k.length===1?'':'s'}`;
+  } else if (view === 'pnl-combined') {
+    const c = e.combinedPnl ?? [];
+    if (c.length === 0) {
+      wrap.innerHTML = '<div class="empty">No realized trades yet</div>';
+      legend.innerHTML = ''; caption.textContent = ''; hint.textContent = '';
+      if (app.equityChart) { app.equityChart.destroy(); app.equityChart = null; }
+      return;
+    }
+    datasets = [
+      { label: 'Combined P&L', data: c.map(p => ({ x: new Date(p.t), y: p.value })),
+        borderColor: '#f39c12', backgroundColor: 'rgba(243,156,18,0.08)', fill: true, tension: 0.1, pointRadius: 0, borderWidth: 2 },
+    ];
+    legendHtml = `<span><span class="sw" style="background:#f39c12"></span>Combined cumulative P&amp;L</span>`;
+    captionText = `Sum of realized P&L across both bots. Stitches across bot restarts since it's derived from per-trade pnl, not sim balance.`;
+    hintText = `${c.length} fills`;
+    yFormat = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
+  } else { // pnl-per-bot
+    const i = e.intrinsicPnl ?? [], x = e.ensemblePnl ?? [];
+    if (i.length + x.length === 0) {
+      wrap.innerHTML = '<div class="empty">No realized trades yet</div>';
+      legend.innerHTML = ''; caption.textContent = ''; hint.textContent = '';
+      if (app.equityChart) { app.equityChart.destroy(); app.equityChart = null; }
+      return;
+    }
+    if (i.length) datasets.push({ label: 'Intrinsic', data: i.map(p => ({ x: new Date(p.t), y: p.value })),
+      borderColor: '#4c7dff', backgroundColor: 'rgba(76,125,255,0.08)', fill: false, tension: 0.1, pointRadius: 0, borderWidth: 2 });
+    if (x.length) datasets.push({ label: 'Ensemble', data: x.map(p => ({ x: new Date(p.t), y: p.value })),
+      borderColor: '#9b59b6', backgroundColor: 'rgba(155,89,182,0.08)', fill: false, tension: 0.1, pointRadius: 0, borderWidth: 2 });
+    legendHtml = `<span><span class="sw" style="background:#4c7dff"></span>Intrinsic</span><span><span class="sw" style="background:#9b59b6"></span>Ensemble</span>`;
+    captionText = `Per-bot cumulative realized P&L. Survives --fresh restarts because it's computed from CSV history.`;
+    hintText = `${i.length+x.length} fills`;
+    yFormat = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
   }
 
-  if (app.equityChart) app.equityChart.destroy();
-
-  if (datasets.length === 0) {
-    document.getElementById('equity-wrap').innerHTML = '<div class="empty">No trade history yet</div>';
-    return;
-  }
-  // Re-create canvas in case we previously showed empty message
+  // Ensure the canvas exists (empty views may have replaced the wrap contents)
   if (!document.getElementById('equity-chart')) {
-    document.getElementById('equity-wrap').innerHTML = '<canvas id="equity-chart"></canvas>';
+    wrap.innerHTML = '<canvas id="equity-chart"></canvas>';
   }
-
+  if (app.equityChart) app.equityChart.destroy();
   app.equityChart = new Chart(document.getElementById('equity-chart').getContext('2d'), {
     type: 'line',
     data: { datasets },
@@ -666,15 +709,18 @@ function renderEquity() {
         legend: { display: false },
         tooltip: {
           backgroundColor: '#1a2236', borderColor: '#252d3f', borderWidth: 1,
-          callbacks: { label: ctx => `${ctx.dataset.label}: $${ctx.parsed.y.toFixed(2)}` },
+          callbacks: { label: ctx => `${ctx.dataset.label}: ${yFormat(ctx.parsed.y)}` },
         },
       },
       scales: {
         x: { type: 'time', time: { unit: 'hour' }, grid: { color: '#252d3f' }, ticks: { color: '#8b93a8', font: { size: 11 } } },
-        y: { grid: { color: '#252d3f' }, ticks: { color: '#8b93a8', font: { size: 11 }, callback: v => '$' + v.toFixed(0) } },
+        y: { grid: { color: '#252d3f' }, ticks: { color: '#8b93a8', font: { size: 11 }, callback: yFormat } },
       },
     },
   });
+  legend.innerHTML = legendHtml;
+  caption.textContent = captionText;
+  hint.textContent = hintText;
 }
 
 // ─── Header pills ─────────────────────────────────────────────────────
@@ -734,6 +780,7 @@ function wireFilters() {
   document.getElementById('fc-refresh').addEventListener('click', loadForecast);
   document.getElementById('fc-city').addEventListener('change', loadForecast);
   document.getElementById('fc-days').addEventListener('change', loadForecast);
+  document.getElementById('eq-view').addEventListener('change', renderEquity);
 }
 
 // ─── Boot ─────────────────────────────────────────────────────────────
