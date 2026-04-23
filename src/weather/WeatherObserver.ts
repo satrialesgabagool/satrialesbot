@@ -15,7 +15,13 @@
 
 import { fetchWithRetry } from "../net/fetchWithRetry";
 
-const USER_AGENT = "(Satriales Weather Bot, satriales@proton.me)";
+// NWS requires *a* User-Agent; an email is recommended (not required) so they
+// can contact you if your bot misbehaves. Set NWS_CONTACT_EMAIL in your .env
+// to include one; otherwise a no-PII default is used.
+const NWS_CONTACT_EMAIL = process.env.NWS_CONTACT_EMAIL?.trim();
+const USER_AGENT = NWS_CONTACT_EMAIL
+  ? `(Satriales Weather Bot, ${NWS_CONTACT_EMAIL})`
+  : "(Satriales Weather Bot)";
 
 /**
  * ICAO station codes for NWS Daily Climate Report resolution.

@@ -1,10 +1,28 @@
 node_modules/
 dist/
+
+# Local env
 .env
-state/*.json
-state/*.lock
-logs/*.log
-logs/*.ndjson
+.env.*
+!.env.example
+
+# Runtime state (bot locks, sim state, daily trackers)
+state/
+logs/
 results/
-*.lock
+data/
+
+# Archived / deprecated code kept locally for reference
+Legacy Models/
+
+# OS
 .DS_Store
+
+# Secrets / credentials — never commit these
+*.pem
+*.key
+*-private*
+*secret*
+*credentials*
+.kalshi/
+kalshi-*.txt

@@ -91,7 +91,14 @@ export class KalshiClient {
       opts.body = JSON.stringify(body);
     }
 
-    const res = await fetchWithRetry(url, opts, { maxRetries: 2 });
+    // CRITICAL: POSTs that mutate state (create/cancel orders) MUST NOT retry.
+    // A network timeout on a successful server-side POST would cause duplicate
+    // submission on retry, triggering 409 "order_already_exists" errors and
+    // potentially placing the same order twice if Kalshi didn't dedup.
+    const isMutatingPost = (method === "POST" || method === "DELETE") && (path.includes("/orders") || path.includes("/portfolio"));
+    const maxRetries = isMutatingPost ? 0 : 2;
+
+    const res = await fetchWithRetry(url, opts, { maxRetries });
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -180,6 +187,54 @@ export class KalshiClient {
     return this.request<KalshiOrderBook>("GET", `/markets/${ticker}/orderbook${qs}`, undefined, true);
   }
 
+  /**
+   * Get historical trades for a market (public endpoint).
+   * Paginated via cursor.
+   */
+  async getTrades(params: {
+    ticker: string;
+    limit?: number;
+    cursor?: string;
+    min_ts?: number;  // unix seconds
+    max_ts?: number;
+  }): Promise<{ trades: any[]; cursor?: string }> {
+    const qs = new URLSearchParams();
+    qs.set("ticker", params.ticker);
+    if (params.limit) qs.set("limit", String(params.limit));
+    if (params.cursor) qs.set("cursor", params.cursor);
+    if (params.min_ts) qs.set("min_ts", String(params.min_ts));
+    if (params.max_ts) qs.set("max_ts", String(params.max_ts));
+    return this.request<{ trades: any[]; cursor?: string }>("GET", `/markets/trades?${qs.toString()}`);
+  }
+
+  /**
+   * Paginated pull of ALL trades for a market. Caps at maxPages (default 20 = 10k trades).
+   */
+  async getAllTrades(params: {
+    ticker: string;
+    min_ts?: number;
+    max_ts?: number;
+    maxPages?: number;
+  }): Promise<any[]> {
+    const all: any[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    const maxPages = params.maxPages ?? 20;
+    do {
+      const res = await this.getTrades({
+        ticker: params.ticker,
+        limit: 500,
+        cursor,
+        min_ts: params.min_ts,
+        max_ts: params.max_ts,
+      });
+      all.push(...(res.trades ?? []));
+      cursor = res.cursor || undefined;
+      pages++;
+    } while (cursor && pages < maxPages);
+    return all;
+  }
+
   // ─── Authenticated: Orders ────────────────────────────────────────
 
   /**
@@ -194,6 +249,26 @@ export class KalshiClient {
    */
   async cancelOrder(orderId: string): Promise<void> {
     await this.request<void>("DELETE", `/portfolio/orders/${orderId}`, undefined, true);
+  }
+
+  /**
+   * List portfolio orders (resting, canceled, executed).
+   */
+  async getOrders(params?: {
+    status?: "resting" | "canceled" | "executed";
+    ticker?: string;
+    event_ticker?: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<{ orders: any[]; cursor?: string }> {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set("status", params.status);
+    if (params?.ticker) qs.set("ticker", params.ticker);
+    if (params?.event_ticker) qs.set("event_ticker", params.event_ticker);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.cursor) qs.set("cursor", params.cursor);
+    const query = qs.toString();
+    return this.request("GET", `/portfolio/orders${query ? `?${query}` : ""}`, undefined, true);
   }
 
   // ─── Authenticated: Portfolio ─────────────────────────────────────

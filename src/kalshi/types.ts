@@ -107,6 +107,10 @@ export interface CreateOrderRequest {
   action: "buy" | "sell";
   count?: number;
   count_fp?: string;
+  // Integer cents (newer API) — preferred
+  yes_price?: number;
+  no_price?: number;
+  // String dollars (older API, still accepted)
   yes_price_dollars?: string;
   no_price_dollars?: string;
   client_order_id?: string;

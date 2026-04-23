@@ -18,6 +18,7 @@ import { detectSameDayLock, lockedBracketProbability, type METARLockResult } fro
 import { kalshiFee } from "./KalshiFees";
 import { fetchWithRetry } from "../net/fetchWithRetry";
 import { KalshiClient } from "../kalshi/KalshiClient";
+import type { KalshiExecutor } from "../kalshi/KalshiExecutor";
 import { appendFileSync, existsSync, writeFileSync, readFileSync, renameSync, mkdirSync } from "fs";
 import { join } from "path";
 
@@ -113,6 +114,56 @@ export interface SimulatorConfig {
   /** Exchange label for display/logging */
   exchange?: "polymarket" | "kalshi";
 
+  /**
+   * Trading mode:
+   *   - "paper" (default): fills against simulated prices, no real orders
+   *   - "live": places REAL orders via KalshiExecutor (production OR demo)
+   * For "live", pass a KalshiExecutor in the constructor.
+   */
+  mode?: "paper" | "live";
+
+  // ─── Strategy selection ─────────────────────────────────────────
+  /**
+   * Which scan strategy to run:
+   *  - "ladder": multi-bracket edge-weighted ladder (original — unprofitable)
+   *  - "intrinsic": buy the market's favorite bracket at $0.70-$0.95
+   *  - "ensemble_forecast": use 82-member GFS+ECMWF ensemble to pick winners
+   *    at T-24h entry, before market convergence. Tape backtest +68% ROI on 17 bets.
+   */
+  strategy?: "ladder" | "intrinsic" | "ensemble_forecast";
+  /** Hours before close to target for intrinsic entry (default 8) */
+  intrinsicHoursBefore?: number;
+  /** Tolerance window — accept markets within ±this hours of target (default 4) */
+  intrinsicWindowHours?: number;
+  /** Min favorite price (default 0.70) */
+  intrinsicMinPrice?: number;
+  /** Max favorite price (default 0.95) */
+  intrinsicMaxPrice?: number;
+  /** Min gap between favorite and runner-up (default 0.05) */
+  intrinsicMinGap?: number;
+  /** Budget per intrinsic bet (default 3) */
+  intrinsicBetSize?: number;
+
+  // ─── Ensemble-forecast strategy ─────────────────────────────────
+  /** Hours before close to evaluate (default 24) */
+  ensembleHoursBefore?: number;
+  /** Tolerance window hours (default 12 — wide to catch opportunities) */
+  ensembleWindowHours?: number;
+  /** Min ensemble probability to bet (default 0.40) */
+  ensembleMinProb?: number;
+  /** Max entry price in dollars (default 0.50) */
+  ensembleMaxPrice?: number;
+  /** Budget per bet (default 10) */
+  ensembleBetSize?: number;
+
+  // ─── Persistence overrides (for running multiple bots in parallel) ─
+  /** Custom state file path (defaults to state/weather-sim.json) */
+  stateFilePath?: string;
+  /** Custom trades CSV path (defaults to results/weather-trades.csv) */
+  tradesCsvPath?: string;
+  /** Instance name for logging (default "sim") */
+  instanceName?: string;
+
   // ─── Snipe mode ─────────────────────────────────────────────────
   /** Enable late-day sniping — buy the winning bracket after actual temp is observed */
   snipeEnabled: boolean;
@@ -157,6 +208,20 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   snipeMaxPrice: 0.92,     // max 92¢ for the winner = min 8% return
   snipeBudget: 25,         // $25 per snipe (single winning bracket)
   snipeMinConfidence: "likely_final",
+  // Strategy defaults
+  strategy: "ladder",
+  intrinsicHoursBefore: 8,
+  intrinsicWindowHours: 4,
+  intrinsicMinPrice: 0.70,
+  intrinsicMaxPrice: 0.95,
+  intrinsicMinGap: 0.05,
+  intrinsicBetSize: 3,
+  // Ensemble-forecast defaults
+  ensembleHoursBefore: 24,
+  ensembleWindowHours: 12,
+  ensembleMinProb: 0.40,
+  ensembleMaxPrice: 0.50,
+  ensembleBetSize: 10,
 };
 
 const RESULTS_DIR = join(import.meta.dir, "../../results");
@@ -181,6 +246,12 @@ interface PersistedState {
   resolvedMarketKeys: string[];
   /** Markets we've already placed ladders on (open or closed) — prevents duplicate ladders */
   activeLadderKeys: string[];
+  /** Snipe keys we've fired — survives restarts, prevents re-orders on same ticker */
+  snipedKeys?: string[];
+  /** Intrinsic keys we've fired */
+  intrinsicKeys?: string[];
+  /** Ensemble keys we've fired */
+  ensembleFiredKeys?: string[];
   savedAt: string;
 }
 
@@ -191,6 +262,9 @@ export class WeatherSimulator {
   private state: SimulatorState;
   private positionCounter = 0;
   private running = false;
+  /** Per-instance paths — overridable for running multiple bots in parallel */
+  private statePath: string;
+  private tradesCsv: string;
   private scanTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Markets that have been fully resolved — never re-buy these (keyed as "city-date-type") */
@@ -205,8 +279,13 @@ export class WeatherSimulator {
   onScanComplete?: (opportunities: number) => void;
   onDashboardUpdate?: () => void;
 
+  /** Live trading executor — must be set when config.mode === "live" */
+  executor: KalshiExecutor | null = null;
+
   constructor(config?: Partial<SimulatorConfig>, resume: boolean = false) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.statePath = this.config.stateFilePath ?? STATE_PATH;
+    this.tradesCsv = this.config.tradesCsvPath ?? TRADES_CSV;
 
     // Try to resume from saved state
     if (resume) {
@@ -231,7 +310,17 @@ export class WeatherSimulator {
         if (loaded.activeLadderKeys) {
           for (const key of loaded.activeLadderKeys) this.activeLadderKeys.add(key);
         }
-        // Also rebuild from actual positions in case state was saved before these fields existed
+        // Restore strategy-specific fire keys so restarts don't re-order same tickers
+        if (loaded.snipedKeys) {
+          for (const key of loaded.snipedKeys) this.snipedKeys.add(key);
+        }
+        if (loaded.intrinsicKeys) {
+          for (const key of loaded.intrinsicKeys) this.intrinsicKeys.add(key);
+        }
+        if (loaded.ensembleFiredKeys) {
+          for (const key of loaded.ensembleFiredKeys) this.ensembleFiredKeys.add(key);
+        }
+        // Also rebuild from actual positions
         for (const pos of loaded.closedPositions) {
           const key = `${pos.market.city.toLowerCase()}-${pos.market.date}-${pos.market.type}`;
           this.resolvedMarketKeys.add(key);
@@ -240,6 +329,10 @@ export class WeatherSimulator {
         for (const pos of loaded.positions) {
           const key = `${pos.market.city.toLowerCase()}-${pos.market.date}-${pos.market.type}`;
           this.activeLadderKeys.add(key);
+          // If a position exists on a ticker, we've fired for it — add to all dedup sets
+          if (pos.ladderGroup?.startsWith("intrinsic-")) this.intrinsicKeys.add(`intrinsic-${pos.market.city.toLowerCase()}-${pos.market.date}`);
+          if (pos.ladderGroup?.startsWith("ensemble-")) this.ensembleFiredKeys.add(`ensemble-${pos.market.city.toLowerCase()}-${pos.market.date}`);
+          if (pos.ladderGroup?.startsWith("snipe-")) this.snipedKeys.add(`snipe-${pos.market.city.toLowerCase()}-${pos.market.date}`);
         }
 
         this.log(
@@ -290,7 +383,7 @@ export class WeatherSimulator {
       balance: this.state.balance,
       deployed: this.state.deployed,
       positions: this.state.positions,
-      closedPositions: this.state.closedPositions.slice(-50), // keep last 50 to avoid unbounded growth
+      closedPositions: this.state.closedPositions.slice(-50),
       totalPnl: this.state.totalPnl,
       wins: this.state.wins,
       losses: this.state.losses,
@@ -298,19 +391,22 @@ export class WeatherSimulator {
       positionCounter: this.positionCounter,
       resolvedMarketKeys: [...this.resolvedMarketKeys],
       activeLadderKeys: [...this.activeLadderKeys],
+      snipedKeys: [...this.snipedKeys],
+      intrinsicKeys: [...this.intrinsicKeys],
+      ensembleFiredKeys: [...this.ensembleFiredKeys],
       savedAt: new Date().toISOString(),
     };
 
     // Atomic write: temp file then rename
-    const tmpPath = STATE_PATH + ".tmp";
+    const tmpPath = this.statePath + ".tmp";
     writeFileSync(tmpPath, JSON.stringify(persisted, null, 2), "utf-8");
-    renameSync(tmpPath, STATE_PATH);
+    renameSync(tmpPath, this.statePath);
   }
 
   private loadState(): PersistedState | null {
-    if (!existsSync(STATE_PATH)) return null;
+    if (!existsSync(this.statePath)) return null;
     try {
-      const raw = readFileSync(STATE_PATH, "utf-8");
+      const raw = readFileSync(this.statePath, "utf-8");
       const data = JSON.parse(raw) as PersistedState;
       // Validate it has open positions or recent activity
       if (data.positions && data.balance !== undefined) return data;
@@ -320,24 +416,25 @@ export class WeatherSimulator {
     }
   }
 
-  /** Check if a saved state exists */
-  static hasSavedState(): boolean {
-    return existsSync(STATE_PATH);
+  /** Check if a saved state exists (default path) */
+  static hasSavedState(path: string = STATE_PATH): boolean {
+    return existsSync(path);
   }
 
-  /** Delete saved state (fresh start) */
-  static clearSavedState() {
-    if (existsSync(STATE_PATH)) {
-      writeFileSync(STATE_PATH, "");
+  /** Delete saved state (fresh start, default path) */
+  static clearSavedState(path: string = STATE_PATH) {
+    if (existsSync(path)) {
+      writeFileSync(path, "");
     }
   }
 
   // ─── CSV ─────────────────────────────────────────────────────────
 
   private ensureCSV() {
-    if (!existsSync(RESULTS_DIR)) require("fs").mkdirSync(RESULTS_DIR, { recursive: true });
-    if (!existsSync(TRADES_CSV) || readFileSync(TRADES_CSV, "utf-8").trim() === "") {
-      writeFileSync(TRADES_CSV, TRADES_HEADER);
+    const dir = this.tradesCsv.substring(0, this.tradesCsv.lastIndexOf("/"));
+    if (dir && !existsSync(dir)) require("fs").mkdirSync(dir, { recursive: true });
+    if (!existsSync(this.tradesCsv) || readFileSync(this.tradesCsv, "utf-8").trim() === "") {
+      writeFileSync(this.tradesCsv, TRADES_HEADER);
     }
   }
 
@@ -362,7 +459,7 @@ export class WeatherSimulator {
       pos.pnl.toFixed(2),
       this.state.balance.toFixed(2),
     ].join(",") + "\n";
-    appendFileSync(TRADES_CSV, row);
+    appendFileSync(this.tradesCsv, row);
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────
@@ -448,15 +545,28 @@ export class WeatherSimulator {
       this.log("State reconciliation: counters already consistent ✓", "dim");
     }
 
-    // Initial scan
-    await this.scanAndTrade();
-    if (this.config.snipeEnabled) await this.scanForSnipes();
+    // Dispatch to strategy
+    const strategy = this.config.strategy ?? "ladder";
+    const runScan = async () => {
+      if (strategy === "intrinsic") {
+        await this.scanForIntrinsicWinners();
+        await this.checkResolutions();
+      } else if (strategy === "ensemble_forecast") {
+        await this.scanForEnsembleForecasts();
+        await this.checkResolutions();
+      } else {
+        await this.scanAndTrade();
+        if (this.config.snipeEnabled) await this.scanForSnipes();
+      }
+    };
+
+    this.log(`Strategy: ${strategy}`, "cyan");
+    await runScan();
 
     // Periodic scan
     this.scanTimer = setInterval(async () => {
       if (!this.running) return;
-      await this.scanAndTrade();
-      if (this.config.snipeEnabled) await this.scanForSnipes();
+      await runScan();
     }, this.config.scanIntervalMs);
   }
 
@@ -663,12 +773,36 @@ export class WeatherSimulator {
       );
 
       for (const { bracket, prob, edge, allocation } of allocations) {
-        const entryPrice = bracket.outcomePrices[0];
-        const shares = Math.floor(allocation / entryPrice);
+        let entryPrice = bracket.outcomePrices[0];
+        let shares = Math.floor(allocation / entryPrice);
         if (shares < 1) continue;
 
-        const cost = shares * entryPrice;
+        let cost = shares * entryPrice;
         if (cost > this.state.balance - this.state.deployed) continue;
+
+        // ─── LIVE MODE: place real Kalshi order ───
+        if (this.config.mode === "live" && this.executor) {
+          const ticker = (bracket as any)._kalshiTicker || (bracket as any).slug;
+          if (!ticker) {
+            this.log(`  SKIP: no Kalshi ticker for bracket`, "yellow");
+            continue;
+          }
+          const result = await this.executor.placeOrder({
+            ticker,
+            side: "yes",
+            askPrice: entryPrice,
+            maxShares: shares,
+            budget: allocation,
+          });
+          if (!result.success) {
+            // Log reason and skip this leg — keep scanning
+            continue;
+          }
+          // Update from actual fill
+          shares = result.filledShares;
+          entryPrice = result.avgPriceDollars;
+          cost = result.filledCostUSD;
+        }
 
         const pos: WeatherPosition = {
           id: `WP-${++this.positionCounter}`,
@@ -732,6 +866,341 @@ export class WeatherSimulator {
 
   /** Set of snipe keys we've already fired — prevents duplicate snipes */
   private snipedKeys = new Set<string>();
+
+  // ─── Intrinsic-winner strategy ─────────────────────────────────
+  //
+  // Tape analysis of 462k KXHIGH fills showed takers in cheap brackets
+  // ($0.03-$0.30) lose ~$0.04/share, while takers in $0.70-$0.95 brackets
+  // 4-12h before close win ~$0.05/share. This scan implements the
+  // profitable side:
+  //
+  //   1. Each event: find the bracket the MARKET thinks is most likely
+  //      (highest yes_ask/mid price).
+  //   2. Verify favorite is in [minPrice, maxPrice] and has meaningful
+  //      gap over runner-up.
+  //   3. Verify time-to-close is in the 4-12h sweet spot.
+  //   4. Buy the favorite. Hold to resolution.
+  //
+  // Tape replay: 17 bets, 94% WR, +5.6% ROI, no forecast needed.
+
+  /** Set of intrinsic keys we've already fired — prevents duplicate bets per market */
+  private intrinsicKeys = new Set<string>();
+
+  // ─── Ensemble-forecast strategy ─────────────────────────────────
+  //
+  // Uses the 82-member GFS+ECMWF ensemble to identify the most likely winning
+  // bracket at T-24h before close, entering while market prices are still
+  // uncertain (avg ~$0.30-$0.50 for winners at this horizon per tape analysis).
+  //
+  // Tape backtest: ~33% accuracy, avg entry $0.20, +68% ROI on 17 bets.
+  // Break-even WR at these prices is ~21%.
+
+  /** Set of ensemble bets already fired per market */
+  private ensembleFiredKeys = new Set<string>();
+
+  async scanForEnsembleForecasts() {
+    this.log("Ensemble-forecast scan — 82-member ensemble pick at T-24h window...", "magenta");
+
+    const finder = this.config.marketFinder ?? findWeatherMarkets;
+    let markets: WeatherMarket[];
+    try {
+      markets = await finder({ daysAhead: 2 });
+    } catch (err) {
+      this.log(`Ensemble scan fetch failed: ${err}`, "red");
+      return;
+    }
+
+    const now = Date.now();
+    const targetH = this.config.ensembleHoursBefore ?? 24;
+    const windowH = this.config.ensembleWindowHours ?? 12;
+    const minProb = this.config.ensembleMinProb ?? 0.40;
+    const maxPrice = this.config.ensembleMaxPrice ?? 0.50;
+    const betSize = this.config.ensembleBetSize ?? 10;
+
+    const highMarkets = markets.filter(m => m.type === "high");
+    let fired = 0;
+
+    for (const market of highMarkets) {
+      const key = `ensemble-${market.city.toLowerCase()}-${market.date}`;
+      if (this.ensembleFiredKeys.has(key)) continue;
+
+      const hoursToClose = (new Date(market.endDate).getTime() - now) / (1000 * 60 * 60);
+      if (hoursToClose < targetH - windowH || hoursToClose > targetH + windowH) continue;
+
+      // Fetch the 82-member ensemble forecast for this city+date
+      const ensemble = await fetchEnsembleForecast(market.city, 3);
+      if (!ensemble) {
+        this.log(`ENSEMBLE skip ${market.city}: forecast fetch failed`, "dim");
+        continue;
+      }
+      const dayForecast = ensemble.forecasts.find(f => f.date === market.date);
+      if (!dayForecast || !dayForecast.highFMembers || dayForecast.highFMembers.length < 20) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: no member data (${dayForecast?.highFMembers?.length ?? 0} members)`, "dim");
+        continue;
+      }
+
+      // Count members per bracket (using NWS rounding convention)
+      const counts = new Map<string, number>();
+      const members = dayForecast.highFMembers;
+      let totalValid = 0;
+      for (const temp of members) {
+        if (typeof temp !== "number" || !isFinite(temp)) continue;
+        const rounded = Math.round(temp);
+        for (const br of market.brackets) {
+          const lo = (br.lowF != null && isFinite(br.lowF)) ? br.lowF : -Infinity;
+          const hi = (br.highF != null && isFinite(br.highF)) ? br.highF : Infinity;
+          if (rounded >= lo && rounded <= hi) {
+            const ticker = (br as any)._kalshiTicker || (br as any).slug;
+            counts.set(ticker, (counts.get(ticker) ?? 0) + 1);
+            totalValid++;
+            break;
+          }
+        }
+      }
+      if (totalValid === 0) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: members don't match any bracket`, "yellow");
+        continue;
+      }
+
+      // Find bracket with highest probability
+      let bestTicker: string | null = null;
+      let bestCount = 0;
+      for (const [ticker, count] of counts) {
+        if (count > bestCount) { bestTicker = ticker; bestCount = count; }
+      }
+      if (!bestTicker) continue;
+
+      const probability = bestCount / totalValid;
+      const bestBracket = market.brackets.find(b => ((b as any)._kalshiTicker || (b as any).slug) === bestTicker);
+      if (!bestBracket) continue;
+
+      const midPrice = bestBracket.outcomePrices[0];
+      const actualAsk = (bestBracket as any)._yesAsk ?? midPrice;
+      const orderPrice = Math.min(0.99, actualAsk + 0.03);
+
+      // Filter: min probability
+      if (probability < minProb) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: prob ${(probability * 100).toFixed(0)}% < ${(minProb * 100).toFixed(0)}% (pick: ${this.bracketLabel(bestBracket)})`, "dim");
+        continue;
+      }
+
+      // Filter: max price (key — we want cheap entries)
+      if (orderPrice > maxPrice) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: order price $${orderPrice.toFixed(2)} > $${maxPrice.toFixed(2)} max (pick ${this.bracketLabel(bestBracket)} at ${(probability * 100).toFixed(0)}% prob)`, "dim");
+        continue;
+      }
+
+      // Size + budget
+      const budget = Math.min(betSize, this.state.balance - this.state.deployed);
+      const shares = Math.floor(budget / orderPrice);
+      if (shares < 1) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: insufficient budget`, "yellow");
+        continue;
+      }
+      let cost = shares * orderPrice;
+      let entryPrice = orderPrice;
+      let filledShares = shares;
+
+      // Live mode: place real order
+      if (this.config.mode === "live" && this.executor) {
+        const result = await this.executor.placeOrder({
+          ticker: bestTicker,
+          side: "yes",
+          askPrice: orderPrice,
+          maxShares: shares,
+          budget,
+        });
+        if (!result.success) continue;
+        filledShares = result.filledShares;
+        entryPrice = result.avgPriceDollars;
+        cost = result.filledCostUSD;
+      }
+
+      const pos: WeatherPosition = {
+        id: `WP-${++this.positionCounter}`,
+        market,
+        bracket: bestBracket,
+        shares: filledShares,
+        entryPrice,
+        cost,
+        forecastTempF: dayForecast.ensembleHighF,
+        forecastProb: probability,
+        edge: probability - midPrice,
+        modelSpreadF: dayForecast.spreadHighF,
+        modelCount: dayForecast.modelCount,
+        hoursToResolution: hoursToClose,
+        entryTime: new Date().toISOString(),
+        status: "open",
+        pnl: 0,
+        ladderGroup: `ensemble-${market.city}-${market.date}`,
+      };
+
+      this.state.positions.push(pos);
+      this.state.deployed += cost;
+      this.state.balance -= cost;
+      this.ensembleFiredKeys.add(key);
+      this.activeLadderKeys.add(`${market.city.toLowerCase()}-${market.date}-${market.type}`);
+      this.logTrade("ENSEMBLE", pos);
+      this.onPositionOpened?.(pos);
+      fired++;
+
+      this.log(
+        `🔬 ENSEMBLE ${market.city} ${market.date}: ${this.bracketLabel(bestBracket)} @ $${entryPrice.toFixed(2)} ` +
+        `(prob ${(probability * 100).toFixed(0)}%, ${filledShares}sh, $${cost.toFixed(2)}, ` +
+        `${hoursToClose.toFixed(1)}h to close, ens_high=${dayForecast.ensembleHighF.toFixed(0)}°F)`,
+        "green"
+      );
+    }
+
+    if (fired === 0) {
+      this.log("Ensemble-forecast scan: no candidates this cycle", "dim");
+    } else {
+      this.log(`Ensemble-forecast scan: ${fired} bet(s) placed`, "green");
+      this.saveState();
+      this.onDashboardUpdate?.();
+    }
+  }
+
+  async scanForIntrinsicWinners() {
+    this.log("Intrinsic scan — looking for market favorites in $0.70-$0.95 zone...", "magenta");
+
+    const finder = this.config.marketFinder ?? findWeatherMarkets;
+    let markets: WeatherMarket[];
+    try {
+      markets = await finder({ daysAhead: 1 });
+    } catch (err) {
+      this.log(`Intrinsic scan market fetch failed: ${err}`, "red");
+      return;
+    }
+
+    const now = Date.now();
+    const targetH = this.config.intrinsicHoursBefore ?? 8;
+    const windowH = this.config.intrinsicWindowHours ?? 4;
+    const minPrice = this.config.intrinsicMinPrice ?? 0.70;
+    const maxPrice = this.config.intrinsicMaxPrice ?? 0.95;
+    const minGap = this.config.intrinsicMinGap ?? 0.05;
+    const betSize = this.config.intrinsicBetSize ?? 3;
+
+    // Only events with a "high" type that are within the entry window
+    const highMarkets = markets.filter(m => m.type === "high");
+    let fired = 0;
+
+    for (const market of highMarkets) {
+      const key = `intrinsic-${market.city.toLowerCase()}-${market.date}`;
+      if (this.intrinsicKeys.has(key)) continue;
+
+      const hoursToClose = (new Date(market.endDate).getTime() - now) / (1000 * 60 * 60);
+      if (hoursToClose < targetH - windowH || hoursToClose > targetH + windowH) {
+        // outside entry window — not this scan
+        continue;
+      }
+
+      // Find favorite among all brackets (highest yes_ask)
+      const priced = market.brackets
+        .map(b => ({ bracket: b, price: b.outcomePrices[0] }))
+        .filter(x => x.price > 0 && x.price < 1)
+        .sort((a, b) => b.price - a.price);
+
+      if (priced.length < 2) continue;
+
+      const favorite = priced[0];
+      const runnerUp = priced[1];
+
+      if (favorite.price < minPrice || favorite.price > maxPrice) {
+        this.log(
+          `INTRINSIC skip ${market.city} ${market.date}: favorite ${this.bracketLabel(favorite.bracket)} @ $${favorite.price.toFixed(2)} outside [$${minPrice.toFixed(2)}, $${maxPrice.toFixed(2)}]`,
+          "dim"
+        );
+        continue;
+      }
+
+      if (favorite.price - runnerUp.price < minGap) {
+        this.log(
+          `INTRINSIC skip ${market.city} ${market.date}: favorite/runnerup gap $${(favorite.price - runnerUp.price).toFixed(2)} < min $${minGap.toFixed(2)}`,
+          "dim"
+        );
+        continue;
+      }
+
+      // Sizing — use max acceptable price (ask + slippage) as the budget ceiling.
+      // The executor will fetch live orderbook and order at best ask if available.
+      const actualAsk = (favorite.bracket as any)._yesAsk ?? favorite.price;
+      const orderPrice = Math.min(0.99, actualAsk + 0.03);  // up to 3¢ slippage tolerance
+      const budget = Math.min(betSize, this.state.balance - this.state.deployed);
+      const shares = Math.floor(budget / orderPrice);
+      if (shares < 1) {
+        this.log(`INTRINSIC skip ${market.city} ${market.date}: insufficient budget (ask $${actualAsk.toFixed(2)})`, "yellow");
+        continue;
+      }
+      let cost = shares * orderPrice;
+      let entryPrice = orderPrice;
+      let filledShares = shares;
+
+      // LIVE mode: place real order
+      if (this.config.mode === "live" && this.executor) {
+        const ticker = (favorite.bracket as any)._kalshiTicker || (favorite.bracket as any).slug;
+        if (!ticker) {
+          this.log(`INTRINSIC skip ${market.city}: no Kalshi ticker`, "yellow");
+          continue;
+        }
+        const result = await this.executor.placeOrder({
+          ticker,
+          side: "yes",
+          askPrice: orderPrice,
+          maxShares: shares,
+          budget,
+        });
+        if (!result.success) continue;
+        filledShares = result.filledShares;
+        entryPrice = result.avgPriceDollars;
+        cost = result.filledCostUSD;
+      }
+
+      const hours = Math.max(0, hoursToClose);
+      const pos: WeatherPosition = {
+        id: `WP-${++this.positionCounter}`,
+        market,
+        bracket: favorite.bracket,
+        shares: filledShares,
+        entryPrice,
+        cost,
+        forecastTempF: 0,              // not used in this strategy
+        forecastProb: favorite.price,  // market-implied probability
+        edge: 1 - favorite.price,      // "edge" = discount from $1
+        modelSpreadF: 0,
+        modelCount: 0,
+        hoursToResolution: hours,
+        entryTime: new Date().toISOString(),
+        status: "open",
+        pnl: 0,
+        ladderGroup: `intrinsic-${market.city}-${market.date}`,
+      };
+
+      this.state.positions.push(pos);
+      this.state.deployed += cost;
+      this.state.balance -= cost;
+      this.intrinsicKeys.add(key);
+      this.activeLadderKeys.add(`${market.city.toLowerCase()}-${market.date}-${market.type}`);
+      this.logTrade("INTRINSIC", pos);
+      this.onPositionOpened?.(pos);
+      fired++;
+
+      this.log(
+        `🎯 INTRINSIC ${market.city} ${market.date}: ${this.bracketLabel(favorite.bracket)} @ $${entryPrice.toFixed(2)} ` +
+        `(gap +$${(favorite.price - runnerUp.price).toFixed(2)} vs ${this.bracketLabel(runnerUp.bracket)}, ` +
+        `${filledShares}sh, $${cost.toFixed(2)}, ${hours.toFixed(1)}h to close)`,
+        "green"
+      );
+    }
+
+    if (fired === 0) {
+      this.log("Intrinsic scan: no candidates this cycle", "dim");
+    } else {
+      this.log(`Intrinsic scan: ${fired} bet(s) placed`, "green");
+      this.saveState();
+      this.onDashboardUpdate?.();
+    }
+  }
 
   async scanForSnipes() {
     if (!this.config.snipeEnabled) return;

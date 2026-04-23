@@ -39,12 +39,17 @@ export async function fetchWithRetry(
 
       if (response.ok) return response;
 
+      // Pull body text for richer error messages (e.g. API validation details)
+      let bodyText = "";
+      try { bodyText = await response.clone().text(); } catch {}
+      const bodySnippet = bodyText ? ` — ${bodyText.slice(0, 500)}` : "";
+
       // Don't retry 4xx errors (except 429 rate limit)
       if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}${bodySnippet}`);
       }
 
-      lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+      lastError = new Error(`HTTP ${response.status}: ${response.statusText}${bodySnippet}`);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
 
