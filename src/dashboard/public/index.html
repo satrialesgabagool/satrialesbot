@@ -86,7 +86,12 @@ td.num { text-align: right; }
 .tag { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
 .tag-intrinsic { background: rgba(76,125,255,0.15); color: #8cacff; border: 1px solid rgba(76,125,255,0.3); }
 .tag-ensemble  { background: rgba(155,89,182,0.15); color: #c098d6; border: 1px solid rgba(155,89,182,0.3); }
+.tag-orphan    { background: rgba(243,156,18,0.15); color: #f5b867; border: 1px solid rgba(243,156,18,0.3); }
+.tag-external  { background: rgba(93,100,120,0.18); color: #a7aec2; border: 1px solid rgba(93,100,120,0.35); }
 .tag-unknown   { background: var(--bg-elev); color: var(--text-dim); }
+.hint { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--text-mute); font-style: italic; }
+.summary-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 11px; color: var(--text-dim); margin-bottom: 10px; padding: 8px 10px; background: var(--bg-elev); border-radius: 5px; }
+.summary-row .s-val { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
 .tag-yes       { background: rgba(46,204,113,0.15); color: #7dd9a4; border: 1px solid rgba(46,204,113,0.3); }
 .tag-no        { background: rgba(231,76,60,0.15); color: #f0a095; border: 1px solid rgba(231,76,60,0.3); }
 
@@ -167,9 +172,11 @@ td.num { text-align: right; }
       <label>Bot
         <select id="pos-bot">
           <option value="all">All</option>
+          <option value="managed">Managed (both bots)</option>
           <option value="intrinsic">Intrinsic</option>
           <option value="ensemble">Ensemble</option>
-          <option value="unknown">Unattributed</option>
+          <option value="orphan">Orphans (weather, untracked)</option>
+          <option value="external">External (non-weather)</option>
         </select>
       </label>
       <label>City
@@ -192,6 +199,7 @@ td.num { text-align: right; }
       </label>
     </div>
   </header>
+  <div id="positions-summary"></div>
   <div id="positions-body"></div>
 </section>
 
@@ -257,6 +265,16 @@ td.num { text-align: right; }
 
 <script>
 // ─── Formatting helpers ───────────────────────────────────────────────
+// Attribution tag with optional orphan-pattern hint
+const attributionTag = p => {
+  const t = `<span class="tag tag-${p.bot}">${p.bot === 'orphan' ? 'orphan' : p.bot === 'external' ? 'external' : p.bot}</span>`;
+  if (p.bot === 'orphan' && p.orphanHint && p.orphanHint !== 'unclear') {
+    const pretty = p.orphanHint === 'likely-intrinsic' ? 'looks intrinsic' : 'looks ensemble';
+    return t + `<span class="hint">${pretty}</span>`;
+  }
+  return t;
+};
+
 const fmt = {
   money: n => (n == null || !isFinite(n)) ? '—' : (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(2),
   moneyPos: n => (n == null || !isFinite(n)) ? '—' : (n > 0 ? '+' : '') + fmt.money(n),
@@ -509,6 +527,7 @@ function renderForecast(d) {
 // ─── Positions table ─────────────────────────────────────────────────
 function renderPositions() {
   const el = document.getElementById('positions-body');
+  const summaryEl = document.getElementById('positions-summary');
   const countEl = document.getElementById('positions-count');
   let pos = [...app.positions];
   const botFilter = document.getElementById('pos-bot').value;
@@ -516,7 +535,8 @@ function renderPositions() {
   const sideFilter = document.getElementById('pos-side').value;
   const sort = document.getElementById('pos-sort').value;
 
-  if (botFilter !== 'all') pos = pos.filter(p => p.bot === botFilter);
+  if (botFilter === 'managed') pos = pos.filter(p => p.bot === 'intrinsic' || p.bot === 'ensemble');
+  else if (botFilter !== 'all') pos = pos.filter(p => p.bot === botFilter);
   if (cityFilter) pos = pos.filter(p => (p.city ?? '').toLowerCase().includes(cityFilter));
   if (sideFilter !== 'all') pos = pos.filter(p => p.side === sideFilter);
   if (sort === 'closes') pos.sort((a,b) => (a.hoursToClose ?? 999) - (b.hoursToClose ?? 999));
@@ -525,11 +545,29 @@ function renderPositions() {
   else if (sort === 'exposure') pos.sort((a,b) => (b.exposureUSD ?? 0) - (a.exposureUSD ?? 0));
 
   countEl.textContent = `(${pos.length})`;
-  if (pos.length === 0) { el.innerHTML = '<div class="empty">No open positions</div>'; return; }
+
+  // Summary chip (shows TOTALS, not filtered counts — so you can see at a glance
+  // what's actively managed vs what's leftover from old sessions vs what isn't ours)
+  const s = app.positionsSummary;
+  if (s && app.positions.length > 0) {
+    const orphanLabel = s.orphan > 0 ? `<span class="s-val yellow">${s.orphan}</span> orphan (${fmt.money(s.orphanExposureUSD)})` : '<span class="s-val">0</span> orphan';
+    const externalLabel = s.external > 0 ? `<span class="s-val mute">${s.external}</span> external (${fmt.money(s.externalExposureUSD)})` : '<span class="s-val">0</span> external';
+    summaryEl.innerHTML = `
+      <div class="summary-row">
+        <span><span class="s-val">${s.managed}</span> managed <span class="mute">(${s.intrinsic} intrinsic, ${s.ensemble} ensemble)</span></span>
+        <span>${orphanLabel}</span>
+        <span>${externalLabel}</span>
+      </div>
+    `;
+  } else {
+    summaryEl.innerHTML = '';
+  }
+
+  if (pos.length === 0) { el.innerHTML = '<div class="empty">No positions match these filters</div>'; return; }
 
   const rows = pos.map(p => `
     <tr>
-      <td>${botTag(p.bot)}</td>
+      <td>${attributionTag(p)}</td>
       <td><code style="font-size:11px">${p.ticker}</code></td>
       <td>${p.city ?? '—'}</td>
       <td>${p.bracketText ? '<span class="bracket">'+p.bracketText+'</span>' : '—'}</td>
@@ -749,6 +787,7 @@ async function refreshAll() {
   app.bots = bots;
   app.portfolio = portfolio;
   app.positions = positions?.positions ?? [];
+  app.positionsSummary = positions?.summary ?? null;
   app.orders = orders?.orders ?? [];
   app.equity = equity;
 

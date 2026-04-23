@@ -308,16 +308,51 @@ app.get("/api/portfolio", async (c) => {
 
 // ─── Live positions (Kalshi + bot attribution, 30s cache) ─────────────
 
-function attributePosition(ticker: string): BotKey | "unknown" {
-  // Attribute by looking for the ticker in each bot's state.positions[].market.ticker
+/**
+ * Four attribution classes:
+ *   - intrinsic / ensemble: actively managed by the named bot (in its state.positions).
+ *   - orphan: KXHIGH* market, not in either state (leftover from a prior bot run
+ *     that --fresh restart discarded; will resolve naturally).
+ *   - external: non-weather market (KXGABBARD, KXGOLDCARDS, etc.) — neither bot
+ *     can touch these, so it came from somewhere else (manual trade, other tool).
+ *
+ * For orphans, we also infer which strategy LIKELY placed them based on entry
+ * price — useful when reviewing post-restart state.
+ */
+type AttributionClass = BotKey | "orphan" | "external";
+type OrphanHint = "likely-intrinsic" | "likely-ensemble" | "unclear";
+
+function buildManagedTickerSets(): Record<BotKey, Set<string>> {
+  const out = {} as Record<BotKey, Set<string>>;
   for (const key of BOT_KEYS) {
     const state = readJson(BOTS[key].statePath);
     const positions: any[] = state?.positions ?? [];
-    if (positions.some(p => p.market?.ticker === ticker || p.ticker === ticker)) {
-      return key;
-    }
+    // In the current WeatherSimulator schema the ticker lives at
+    // position.bracket._kalshiTicker. Fallback to alternate paths in case
+    // older state files are around.
+    out[key] = new Set(
+      positions
+        .map(p => p.bracket?._kalshiTicker ?? p.market?.ticker ?? p.ticker)
+        .filter((t): t is string => typeof t === "string" && t.length > 0),
+    );
   }
-  return "unknown";
+  return out;
+}
+
+function classifyPosition(
+  ticker: string,
+  avgEntryPrice: number,
+  managed: Record<BotKey, Set<string>>,
+): { bot: AttributionClass; orphanHint?: OrphanHint } {
+  for (const key of BOT_KEYS) {
+    if (managed[key].has(ticker)) return { bot: key };
+  }
+  if (!ticker.startsWith("KXHIGH")) return { bot: "external" };
+  // KXHIGH* orphan — infer which strategy likely placed it from the entry price
+  let orphanHint: OrphanHint = "unclear";
+  if (avgEntryPrice >= 0.60 && avgEntryPrice <= 0.98) orphanHint = "likely-intrinsic";
+  else if (avgEntryPrice >= 0.01 && avgEntryPrice <= 0.55) orphanHint = "likely-ensemble";
+  return { bot: "orphan", orphanHint };
 }
 
 app.get("/api/positions", async (c) => {
@@ -325,31 +360,34 @@ app.get("/api/positions", async (c) => {
   if (!k) return c.json({ configured: false, positions: [] });
   try {
     const data = await cached("positions", 30_000, async () => {
-      const [posResp, _] = await Promise.all([
-        k.getPositions({ limit: 200 }),
-        Promise.resolve(null),
-      ]);
+      const posResp = await k.getPositions({ limit: 200 });
       const open = (posResp.market_positions ?? []).filter(p => parseFloat(p.position_fp) !== 0);
-      if (open.length === 0) return { configured: true, positions: [] };
+      if (open.length === 0) {
+        return {
+          configured: true,
+          positions: [],
+          summary: { managed: 0, intrinsic: 0, ensemble: 0, orphan: 0, external: 0, orphanExposureUSD: 0, externalExposureUSD: 0 },
+        };
+      }
 
       // Batch-fetch market snapshots for current prices
       const tickers = open.map(p => p.ticker);
-      // Kalshi's getMarkets supports a tickers= comma list
       const marketsResp = await k.getMarkets({ tickers: tickers.join(","), limit: 200 } as any);
       const marketByTicker = new Map(marketsResp.markets.map(m => [m.ticker, m]));
+
+      // Build the per-bot managed-ticker sets once (avoids re-reading state files N times)
+      const managed = buildManagedTickerSets();
 
       const positions = open.map(p => {
         const posShares = parseFloat(p.position_fp);
         const side: "yes" | "no" = posShares >= 0 ? "yes" : "no";
         const shares = Math.abs(posShares);
-        const traded = parseFloat(p.total_traded_dollars) || 0;
         const exposure = Math.abs(parseFloat(p.market_exposure_dollars) || 0);
         const realized = parseFloat(p.realized_pnl_dollars) || 0;
         const fees = parseFloat(p.fees_paid_dollars) || 0;
         const avgEntryPrice = shares > 0 ? exposure / shares : 0;
 
         const m = marketByTicker.get(p.ticker);
-        // Mark at the resting bid we could hit to exit
         const markPrice = m
           ? side === "yes"
             ? parseFloat(m.yes_bid_dollars) || 0
@@ -361,10 +399,13 @@ app.get("/api/positions", async (c) => {
         const city = (m?.event_ticker ?? p.ticker).match(/KXHIGH([A-Z]+)/)?.[1] ?? null;
         const bracketText = m?.yes_sub_title ?? "";
 
+        const { bot, orphanHint } = classifyPosition(p.ticker, avgEntryPrice, managed);
+
         return {
           ticker: p.ticker,
           eventTicker: m?.event_ticker ?? null,
-          bot: attributePosition(p.ticker),
+          bot,
+          orphanHint: orphanHint ?? null,
           city,
           bracketText,
           side,
@@ -382,7 +423,18 @@ app.get("/api/positions", async (c) => {
           restingOrdersCount: p.resting_orders_count ?? 0,
         };
       });
-      return { configured: true, positions };
+
+      const summary = {
+        managed: positions.filter(p => p.bot === "intrinsic" || p.bot === "ensemble").length,
+        intrinsic: positions.filter(p => p.bot === "intrinsic").length,
+        ensemble: positions.filter(p => p.bot === "ensemble").length,
+        orphan: positions.filter(p => p.bot === "orphan").length,
+        external: positions.filter(p => p.bot === "external").length,
+        orphanExposureUSD: +positions.filter(p => p.bot === "orphan").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
+        externalExposureUSD: +positions.filter(p => p.bot === "external").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
+      };
+
+      return { configured: true, positions, summary };
     });
     return c.json(data);
   } catch (err: any) {
