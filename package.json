@@ -3,15 +3,23 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts",
+    "intrinsic": "bun run kalshi-weather-live-trading.ts",
+    "ensemble": "bun run kalshi-weather-ensemble-trading.ts",
+    "backtest": "bun run kalshi-backtest.ts",
+    "backtest:ensemble": "bun run kalshi-ensemble-backtest.ts",
+    "tape:collect": "bun run kalshi-tape-collect.ts",
+    "tape:report": "bun run kalshi-tape-report.ts",
+    "tape:compare": "bun run kalshi-tape-compare.ts",
+    "tape:replay": "bun run kalshi-tape-replay.ts",
+    "winner-analysis": "bun run kalshi-winner-analysis.ts",
+    "check-orders": "bun run kalshi-check-orders.ts",
+    "reconcile": "bun run kalshi-reconcile-state.ts",
+    "dashboard": "bun run src/dashboard/server.ts",
+    "verify-kalshi": "bun run src/kalshi/verify-auth.ts",
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^5.8.1",
-    "@js-sdsl/ordered-map": "^4.4.2",
-    "ethers": "^6.16.0",
-    "viem": "^2.47.6",
-    "commander": "^14.0.3"
+    "hono": "^4.12.14"
   },
   "devDependencies": {
     "@types/bun": "latest",

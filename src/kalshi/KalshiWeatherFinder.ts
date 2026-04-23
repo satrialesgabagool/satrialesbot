@@ -32,25 +32,28 @@ export interface KalshiWeatherCity {
  * Known KXHIGH series tickers.
  * This list is expanded dynamically if unknown series are found.
  */
+// Coordinates use the NWS Daily Climate Report station (airport ASOS), NOT city center.
+// Kalshi resolves against this station's reading — forecasting for the wrong point
+// introduces systematic bias (up to 2-5°F for coastal/elevation mismatches).
 export const KALSHI_WEATHER_CITIES: KalshiWeatherCity[] = [
-  { seriesTicker: "KXHIGHNY",  city: "New York City", lat: 40.7128, lon: -74.0060, nwsWfo: "okx" },
-  { seriesTicker: "KXHIGHCHI", city: "Chicago",       lat: 41.8781, lon: -87.6298, nwsWfo: "lot" },
-  { seriesTicker: "KXHIGHMIA", city: "Miami",         lat: 25.7617, lon: -80.1918, nwsWfo: "mfl" },
-  { seriesTicker: "KXHIGHLAX", city: "Los Angeles",   lat: 34.0522, lon: -118.2437, nwsWfo: "lox" },
-  { seriesTicker: "KXHIGHAUS", city: "Austin",        lat: 30.2672, lon: -97.7431, nwsWfo: "ewx" },
-  { seriesTicker: "KXHIGHDEN", city: "Denver",        lat: 39.7392, lon: -104.9903, nwsWfo: "bou" },
-  { seriesTicker: "KXHIGHATL", city: "Atlanta",       lat: 33.7490, lon: -84.3880, nwsWfo: "ffc" },
-  { seriesTicker: "KXHIGHDAL", city: "Dallas",        lat: 32.7767, lon: -96.7970, nwsWfo: "fwd" },
-  { seriesTicker: "KXHIGHSEA", city: "Seattle",       lat: 47.6062, lon: -122.3321, nwsWfo: "sew" },
-  { seriesTicker: "KXHIGHHOU", city: "Houston",       lat: 29.7604, lon: -95.3698, nwsWfo: "hgx" },
-  { seriesTicker: "KXHIGHPHX", city: "Phoenix",       lat: 33.4484, lon: -112.0740, nwsWfo: "psr" },
-  { seriesTicker: "KXHIGHBOS", city: "Boston",        lat: 42.3601, lon: -71.0589, nwsWfo: "box" },
-  { seriesTicker: "KXHIGHLAS", city: "Las Vegas",     lat: 36.1699, lon: -115.1398, nwsWfo: "vef" },
-  { seriesTicker: "KXHIGHMIN", city: "Minneapolis",   lat: 44.9778, lon: -93.2650, nwsWfo: "mpx" },
-  { seriesTicker: "KXHIGHPHI", city: "Philadelphia",  lat: 39.9526, lon: -75.1652, nwsWfo: "phi" },
-  { seriesTicker: "KXHIGHSF",  city: "San Francisco", lat: 37.7749, lon: -122.4194, nwsWfo: "mtr" },
-  { seriesTicker: "KXHIGHSA",  city: "San Antonio",   lat: 29.4241, lon: -98.4936, nwsWfo: "ewx" },
-  { seriesTicker: "KXHIGHDC",  city: "Washington DC", lat: 38.9072, lon: -77.0369, nwsWfo: "lwx" },
+  { seriesTicker: "KXHIGHNY",  city: "New York City", lat: 40.7790, lon: -73.9692, nwsWfo: "okx" },  // Central Park (KNYC)
+  { seriesTicker: "KXHIGHCHI", city: "Chicago",       lat: 41.7860, lon: -87.7524, nwsWfo: "lot" },  // Midway (KMDW)
+  { seriesTicker: "KXHIGHMIA", city: "Miami",         lat: 25.7933, lon: -80.2906, nwsWfo: "mfl" },  // MIA (KMIA)
+  { seriesTicker: "KXHIGHLAX", city: "Los Angeles",   lat: 33.9425, lon: -118.4081, nwsWfo: "lox" }, // LAX (KLAX)
+  { seriesTicker: "KXHIGHAUS", city: "Austin",        lat: 30.1945, lon: -97.6699, nwsWfo: "ewx" },  // Bergstrom (KAUS)
+  { seriesTicker: "KXHIGHDEN", city: "Denver",        lat: 39.8617, lon: -104.6732, nwsWfo: "bou" }, // DIA (KDEN)
+  { seriesTicker: "KXHIGHATL", city: "Atlanta",       lat: 33.6367, lon: -84.4281, nwsWfo: "ffc" },  // Hartsfield (KATL)
+  { seriesTicker: "KXHIGHDAL", city: "Dallas",        lat: 32.8968, lon: -97.0380, nwsWfo: "fwd" },  // DFW (KDFW)
+  { seriesTicker: "KXHIGHSEA", city: "Seattle",       lat: 47.4490, lon: -122.3093, nwsWfo: "sew" }, // Sea-Tac (KSEA)
+  { seriesTicker: "KXHIGHHOU", city: "Houston",       lat: 29.6454, lon: -95.2789, nwsWfo: "hgx" },  // Hobby (KHOU)
+  { seriesTicker: "KXHIGHPHX", city: "Phoenix",       lat: 33.4343, lon: -112.0117, nwsWfo: "psr" }, // Sky Harbor (KPHX)
+  { seriesTicker: "KXHIGHBOS", city: "Boston",        lat: 42.3631, lon: -71.0064, nwsWfo: "box" },  // Logan (KBOS)
+  { seriesTicker: "KXHIGHLAS", city: "Las Vegas",     lat: 36.0803, lon: -115.1524, nwsWfo: "vef" }, // Reid (KLAS)
+  { seriesTicker: "KXHIGHMIN", city: "Minneapolis",   lat: 44.8820, lon: -93.2218, nwsWfo: "mpx" },  // MSP (KMSP)
+  { seriesTicker: "KXHIGHPHI", city: "Philadelphia",  lat: 39.8721, lon: -75.2407, nwsWfo: "phi" },  // PHL (KPHL)
+  { seriesTicker: "KXHIGHSF",  city: "San Francisco", lat: 37.6188, lon: -122.3754, nwsWfo: "mtr" }, // SFO (KSFO)
+  { seriesTicker: "KXHIGHSA",  city: "San Antonio",   lat: 29.5340, lon: -98.4691, nwsWfo: "ewx" },  // SAT (KSAT)
+  { seriesTicker: "KXHIGHDC",  city: "Washington DC", lat: 38.8514, lon: -77.0377, nwsWfo: "lwx" },  // Reagan (KDCA)
 ];
 
 // Singleton client for market data (no auth needed)
