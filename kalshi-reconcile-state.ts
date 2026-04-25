@@ -16,8 +16,6 @@
 
 import { KalshiClient } from "./src/kalshi/KalshiClient";
 import { loadCredentialsFromEnv } from "./src/kalshi/KalshiAuth";
-import { writeFileSync, existsSync, mkdirSync } from "fs";
-import { dirname } from "path";
 
 const APPLY = process.argv.includes("--apply");
 
@@ -65,29 +63,91 @@ for (const o of executed) {
   }
 }
 
-// Show plan
-console.log(`${"Ticker".padEnd(32)} ${"Shares".padStart(7)} ${"AvgPx".padStart(7)} ${"Cost".padStart(8)}`);
-console.log("─".repeat(70));
-for (const p of market_positions as any[]) {
-  const pos = p.position ?? 0;
-  if (pos <= 0) continue;
-  const fill = ticker_fills.get(p.ticker);
-  const avgPx = fill?.avgPrice ?? 0;
-  const cost = pos * avgPx;
-  console.log(`${p.ticker.padEnd(32)} ${String(pos).padStart(7)} $${avgPx.toFixed(3).padStart(6)} $${cost.toFixed(2).padStart(7)}`);
+// Show actual Kalshi positions (filter to nonzero)
+const live = (market_positions as any[])
+  .map(p => ({ ...p, posShares: parseFloat(p.position_fp || "0") }))
+  .filter(p => p.posShares !== 0);
+
+console.log(`${"Ticker".padEnd(36)} ${"Shares".padStart(7)} ${"AvgPx".padStart(7)} ${"Cost".padStart(9)}`);
+console.log("─".repeat(72));
+let kalshiCostTotal = 0;
+for (const p of live) {
+  const shares = Math.abs(p.posShares);
+  const exposure = Math.abs(parseFloat(p.market_exposure_dollars || "0"));
+  const avgPx = shares > 0 ? exposure / shares : 0;
+  kalshiCostTotal += exposure;
+  console.log(`${p.ticker.padEnd(36)} ${String(shares).padStart(7)} $${avgPx.toFixed(3).padStart(6)} $${exposure.toFixed(2).padStart(8)}`);
+}
+console.log("─".repeat(72));
+console.log(`${"TOTAL".padEnd(36)} ${String(live.length).padStart(7)}        $${kalshiCostTotal.toFixed(2).padStart(8)}`);
+console.log();
+
+// ─── Bot-state vs Kalshi diff ────────────────────────────────────────
+import { readFileSync, existsSync as fileExists } from "fs";
+
+const BOT_STATES = [
+  { name: "intrinsic", path: "state/weather-intrinsic-sim.json" },
+  { name: "ensemble",  path: "state/weather-ensemble-sim.json" },
+];
+
+const botTickers = new Map<string, { bot: string; shares: number; cost: number }[]>();
+for (const { name, path } of BOT_STATES) {
+  if (!fileExists(path)) continue;
+  try {
+    const s = JSON.parse(readFileSync(path, "utf-8"));
+    for (const pos of (s.positions || []) as any[]) {
+      const ticker = pos?.bracket?._kalshiTicker || pos?.market?.ticker;
+      if (!ticker) continue;
+      const arr = botTickers.get(ticker) || [];
+      arr.push({ bot: name, shares: pos.shares || 0, cost: pos.cost || 0 });
+      botTickers.set(ticker, arr);
+    }
+  } catch {}
+}
+
+const kalshiTickers = new Set(live.map(p => p.ticker));
+const botTickerSet = new Set(botTickers.keys());
+
+const onlyKalshi = [...kalshiTickers].filter(t => !botTickerSet.has(t));
+const onlyBots = [...botTickerSet].filter(t => !kalshiTickers.has(t));
+
+console.log(`${c.cyan}── Reconciliation summary ──${c.reset}`);
+console.log(`  Kalshi has ${kalshiTickers.size} positions; bots track ${botTickerSet.size} unique tickers`);
+console.log(`  ${c.green}In both (managed):${c.reset} ${[...kalshiTickers].filter(t => botTickerSet.has(t)).length}`);
+
+if (onlyKalshi.length) {
+  console.log(`  ${c.yellow}Only on Kalshi (orphans/external/manual):${c.reset} ${onlyKalshi.length}`);
+  for (const t of onlyKalshi) console.log(`    ${t}`);
+}
+if (onlyBots.length) {
+  console.log(`  ${c.red}PHANTOMS — in bot state but not on Kalshi:${c.reset} ${onlyBots.length}`);
+  for (const t of onlyBots) console.log(`    ${t}  (would be a real bug — investigate)`);
+}
+
+// Per-ticker share/cost mismatch
+console.log();
+console.log(`${c.cyan}── Share/cost match per managed ticker ──${c.reset}`);
+let mismatches = 0;
+for (const [ticker, owners] of botTickers) {
+  const livePos = live.find(p => p.ticker === ticker);
+  if (!livePos) continue;
+  const botShares = owners.reduce((s, o) => s + o.shares, 0);
+  const botCost = owners.reduce((s, o) => s + o.cost, 0);
+  const kShares = Math.abs(livePos.posShares);
+  const kCost = Math.abs(parseFloat(livePos.market_exposure_dollars || "0"));
+  const sharesMatch = botShares === kShares;
+  const costMatch = Math.abs(botCost - kCost) < 0.02;
+  if (!sharesMatch || !costMatch) {
+    mismatches++;
+    console.log(`  ${c.red}MISMATCH${c.reset} ${ticker}`);
+    console.log(`    bot: ${botShares}sh @ $${botCost.toFixed(2)} (${owners.map(o => o.bot + ":" + o.shares).join(", ")})`);
+    console.log(`    kalshi: ${kShares}sh @ $${kCost.toFixed(2)}`);
+  }
+}
+if (mismatches === 0) {
+  console.log(`  ${c.green}✓ All managed tickers match Kalshi exactly (shares + cost)${c.reset}`);
 }
 
 console.log();
-console.log(`${c.yellow}⚠️  Manual action required:${c.reset}`);
-console.log(`  This tool shows you what's on Kalshi. To actually SYNC local state,`);
-console.log(`  the cleanest approach is to let the bots TRACK positions going forward`);
-console.log(`  without trying to retro-import old fills (which have complex cost basis).`);
-console.log();
-console.log(`  Recommended approach:`);
-console.log(`   1. Start both bots FRESH (--fresh flag)`);
-console.log(`   2. Bots will ignore existing Kalshi positions (they weren't placed by this session)`);
-console.log(`   3. Existing Kalshi positions resolve naturally; you collect the P&L directly`);
-console.log(`   4. Once resolved, your balance reflects the real outcome`);
-console.log();
-console.log(`  ${c.dim}(This is what the Kalshi UI shows anyway — source of truth.)${c.reset}`);
+console.log(`  ${c.dim}Read-only diagnostic — no state was modified.${c.reset}`);
 console.log();

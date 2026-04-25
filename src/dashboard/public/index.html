@@ -378,121 +378,153 @@ function renderTopCards() {
   const cashText = p?.configured ? fmt.money(p.cashUSD) : '—';
   const pvText = p?.configured ? fmt.money(p.portfolioValueUSD) : '—';
 
+  // 5-card focused layout: account state + the metrics that actually matter.
+  // Pending settlement appears as a 6th card only when there's something pending.
+  // The "Expected P&L (model)" metric moved to the per-bot performance cards
+  // since it now only counts far-from-close positions where the model is
+  // actually informative (we used to surface this front-and-center, but the
+  // numbers were wildly inflated for near-close positions where the market
+  // already knows what we don't).
   el.innerHTML = `
-    <div class="card">
-      <div class="label">Cash balance</div>
+    <div class="card" title="Settled cash in your Kalshi account, available to deploy.">
+      <div class="label">Cash</div>
       <div class="value">${cashText}</div>
-      <div class="sub">${p?.configured ? 'Kalshi account' : 'Kalshi not configured'}</div>
+      <div class="sub">${p?.openPositionCount ?? 0} positions · ${fmt.money(p?.totalDeployedUSD ?? 0)} deployed</div>
     </div>
-    <div class="card">
+    <div class="card" title="Kalshi's reported account value: cash + mark of open positions. Conservative — excludes decided-but-not-yet-settled winners.">
       <div class="label">Portfolio value</div>
       <div class="value">${pvText}</div>
-      <div class="sub">cash + open positions (mark)</div>
+      <div class="sub">Kalshi marked-to-market</div>
     </div>
-    <div class="card">
-      <div class="label">Deployed</div>
-      <div class="value">${p?.configured ? fmt.money(p.totalDeployedUSD) : '—'}</div>
-      <div class="sub">${p?.openPositionCount ?? 0} open positions</div>
+    <div class="card" title="Realized P&L from closed trades + unrealized P&L derived from Kalshi's portfolio value. Source of truth for ongoing P&L.">
+      <div class="label">Total P&amp;L</div>
+      <div class="value ${pnlClass(totalPnlNow)}">${fmt.moneyPos(totalPnlNow)}</div>
+      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · post-settle ~<span class="${pnlClass(totalPnlPostSettle)}">${fmt.moneyPos(totalPnlPostSettle)}</span></div>
     </div>
-    <div class="card" title="Unrealized P&L if you exited at top-of-book bids right now. Optimistic when bid sizes are thin or when winners are decided-but-pending settlement.">
-      <div class="label">Unrealized (bid)</div>
-      <div class="value ${pnlClass(unrealizedBid)}">${fmt.moneyPos(unrealizedBid)}</div>
-      <div class="sub">${unrealizedKalshi != null ? `Kalshi-marked: <span class="${pnlClass(unrealizedKalshi)}">${fmt.moneyPos(unrealizedKalshi)}</span>` : 'marked at bid'}</div>
-    </div>
-    <div class="card">
+    <div class="card" title="P&L from positions that resolved since local midnight today. Updates the moment a position settles.">
       <div class="label">Today's P&amp;L</div>
       <div class="value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)}</div>
       <div class="sub">${(intrinsicBot?.daily?.closedToday ?? 0) + (ensembleBot?.daily?.closedToday ?? 0)} resolved · I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
     </div>
-    <div class="card" title="Realized + Kalshi-marked unrealized = ground-truth current P&L. The 'post-settle' figure adds back pending winners at full mark — what total will be once Kalshi settles them.">
-      <div class="label">Total P&amp;L${unrealizedKalshi != null ? ' (Kalshi)' : ''}</div>
-      <div class="value ${pnlClass(totalPnlNow)}">${fmt.moneyPos(totalPnlNow)}</div>
-      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · ${unrealizedKalshi != null ? `post-settle ~<span class="${pnlClass(totalPnlPostSettle)}">${fmt.moneyPos(totalPnlPostSettle)}</span>` : `unreal ${fmt.moneyPos(unrealizedBid)}`}</div>
-    </div>
     ${(() => {
       const s = app.positionsSummary;
-      if (!s || (s.pendingWinsCount === 0 && s.pendingLossesCount === 0)) return '';
-      const wins = s.pendingWinsCount ?? 0;
-      const losses = s.pendingLossesCount ?? 0;
-      const payout = s.pendingPayoutUSD ?? 0;
-      const lossExp = s.pendingLossExposureUSD ?? 0;
+      const wins = s?.pendingWinsCount ?? 0;
+      const losses = s?.pendingLossesCount ?? 0;
+      const payout = s?.pendingPayoutUSD ?? 0;
+      const lossExp = s?.pendingLossExposureUSD ?? 0;
+      if (wins === 0 && losses === 0) {
+        return `
+          <div class="card" title="No positions are currently in 'decided but not yet settled' state.">
+            <div class="label">⏳ Pending settlement</div>
+            <div class="value dim">$0.00</div>
+            <div class="sub">0 winners · 0 losers</div>
+          </div>
+        `;
+      }
       return `
-        <div class="card" style="border-color:rgba(243,156,18,0.45);background:linear-gradient(180deg,rgba(243,156,18,0.05),var(--bg-card))">
+        <div class="card" style="border-color:rgba(243,156,18,0.45);background:linear-gradient(180deg,rgba(243,156,18,0.05),var(--bg-card))" title="Positions where the YES bid has converged ≥ $0.95 (winners) or ≤ $0.05 (losers) — outcome decided, just waiting for Kalshi to settle and credit cash.">
           <div class="label">⏳ Pending settlement</div>
           <div class="value yellow">${fmt.money(payout)}</div>
-          <div class="sub">${wins} winner${wins===1?'':'s'} (~${fmt.money(payout)} into cash) · ${losses} loser${losses===1?'':'s'} (${fmt.money(lossExp)} written off)</div>
+          <div class="sub">${wins} win${wins===1?'':'s'} (~${fmt.money(payout)} into cash) · ${losses} loss${losses===1?'es':''} ($${lossExp.toFixed(2)} cost written off)</div>
         </div>
       `;
     })()}
-    <div class="card">
-      <div class="label">Session win rate</div>
-      <div class="value">${wr == null ? '—' : fmt.pct0(wr)}</div>
-      <div class="sub">${totalWins}W · ${totalLosses}L</div>
-    </div>
-    <div class="card">
-      <div class="label">Expected P&amp;L (model)</div>
-      <div class="value ${pnlClass(app.positionsSummary?.totalExpectedValueUSD)}">${fmt.moneyPos(app.positionsSummary?.totalExpectedValueUSD ?? null)}</div>
-      <div class="sub">${app.positionsSummary?.positionsWithForecast ?? 0}/${app.positions.length} positions priced by 82-member ensemble${app.positionsSummary?.avgModelProb != null ? ' · avg prob '+fmt.pct0(app.positionsSummary.avgModelProb) : ''}</div>
-    </div>
   `;
 }
 
-// ─── Bot chips ────────────────────────────────────────────────────────
+// ─── Per-bot performance cards ───────────────────────────────────────
+// Replaces the old "9-tile bot chip" with a tighter layout that focuses
+// on performance-evaluation metrics: WR, avg win, avg loss, win/loss
+// ratio, ROI%, today's P&L, capital utilization. Also adds the model EV
+// for THIS bot's open positions (filtered to T-12h+ for relevance).
 function renderBotRow() {
   const el = document.getElementById('bot-row');
   const bots = app.bots?.bots ?? [];
+  // Compute bot-specific model EV from open positions (already filtered server-side
+  // to far-from-close to avoid stale-model garbage)
+  const modelEvByBot = { intrinsic: 0, ensemble: 0 };
+  const modelEvCountByBot = { intrinsic: 0, ensemble: 0 };
+  for (const p of (app.positions ?? [])) {
+    if (p.expectedValueUSD == null) continue;
+    if ((p.hoursToClose ?? 0) < 12) continue; // mirror server-side filter
+    if (p.bot === 'intrinsic' || p.bot === 'ensemble') {
+      modelEvByBot[p.bot] += p.expectedValueUSD;
+      modelEvCountByBot[p.bot] += 1;
+    }
+  }
+
   el.innerHTML = bots.map(b => {
     const statusClass = b.running ? 'ok' : 'bad';
     const statusText = b.running ? 'Running' : 'Stopped';
     const killClass = b.killSwitch ? 'bad' : 'ok';
     const killText = b.killSwitch ? 'HALTED' : 'armed';
     const caps = b.caps ?? {};
+    const t = b.totals ?? {};
+    const dly = b.daily ?? {};
+    const perf = b.performance ?? {};
+    const cap = caps.startingBalance ?? 0;
+    const utilization = cap > 0 ? (t.deployed ?? 0) / cap : 0;
+    const realized = t.totalPnl ?? 0;
+    const todayPnl = dly.dailyPnl ?? 0;
+    const wlRatio = perf.winLossRatio;
+    const wlRatioStr = wlRatio == null ? '—' : `${wlRatio.toFixed(2)}×`;
+    const wlRatioClass = wlRatio == null ? 'dim' : wlRatio >= 1 ? 'green' : 'yellow';
+    const ev = modelEvByBot[b.name] ?? 0;
+    const evCount = modelEvCountByBot[b.name] ?? 0;
+
     return `
       <div class="bot-chip">
         <header>
           <h3>
             ${botTag(b.name)}
             ${b.displayName}
-            <span class="pill ${statusClass}" style="padding:2px 8px;font-size:10px"><span class="dot"></span>${statusText}</span>
+            <span class="pill ${statusClass}" style="padding:2px 8px;font-size:10px"><span class="dot"></span>${statusText} ${fmt.uptime(b.uptimeSec)}</span>
           </h3>
           <span class="pill ${killClass}" style="font-size:10px;padding:2px 8px"><span class="dot"></span>kill ${killText}</span>
         </header>
+        <!-- Headline metrics (3 prominent values) -->
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+          <div title="Cumulative realized P&L from closed trades, post-audit. Includes wins minus losses minus Kalshi fees.">
+            <div class="m-label">Realized P&amp;L</div>
+            <div style="font-size:18px;font-weight:600" class="${pnlClass(realized)}">${fmt.moneyPos(realized)}</div>
+            <div class="m-label" style="margin-top:2px">${perf.roiPct != null ? `${perf.roiPct >= 0 ? '+' : ''}${perf.roiPct.toFixed(1)}% ROI on ${fmt.money(cap)}` : ''}</div>
+          </div>
+          <div title="Win rate from closed trades.">
+            <div class="m-label">Win rate</div>
+            <div style="font-size:18px;font-weight:600">${perf.winRate == null ? '—' : fmt.pct0(perf.winRate)}</div>
+            <div class="m-label" style="margin-top:2px">${t.wins ?? 0}W · ${t.losses ?? 0}L · ${t.closedCount ?? 0} total</div>
+          </div>
+          <div title="Average win divided by average loss. Higher means each winner pays for many losers — what the ensemble strategy targets.">
+            <div class="m-label">Win / loss ratio</div>
+            <div style="font-size:18px;font-weight:600" class="${wlRatioClass}">${wlRatioStr}</div>
+            <div class="m-label" style="margin-top:2px">avg win <span class="green">+$${(perf.avgWinUSD ?? 0).toFixed(2)}</span> · loss <span class="red">$${(perf.avgLossUSD ?? 0).toFixed(2)}</span></div>
+          </div>
+        </div>
+        <!-- Detailed metrics -->
         <div class="bot-meta">
           <div>
-            <div class="m-label">PID / uptime</div>
-            <div class="m-value">${b.pid ?? '—'} · ${fmt.uptime(b.uptimeSec)}</div>
+            <div class="m-label">Today</div>
+            <div class="m-value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)} · ${dly.closedToday ?? 0} closed</div>
+          </div>
+          <div title="Open positions and capital deployed vs the bankroll cap.">
+            <div class="m-label">Open</div>
+            <div class="m-value">${t.openCount ?? 0} pos · ${fmt.money(t.deployed ?? 0)} <span class="dim">(${(utilization * 100).toFixed(0)}%)</span></div>
+          </div>
+          <div title="Forward-looking: sum of model EV across this bot's open T-12h+ positions. Excludes near-close positions where forecast is stale.">
+            <div class="m-label">Model EV (open T+12h)</div>
+            <div class="m-value ${pnlClass(ev)}">${evCount > 0 ? fmt.moneyPos(ev) : '—'} <span class="dim">${evCount > 0 ? `(${evCount})` : ''}</span></div>
+          </div>
+          <div>
+            <div class="m-label">Trade rate</div>
+            <div class="m-value">${perf.tradesPerDay != null ? perf.tradesPerDay.toFixed(1) + '/day' : '—'} <span class="dim">${perf.daysSinceLaunch != null ? `over ${perf.daysSinceLaunch}d` : ''}</span></div>
           </div>
           <div>
             <div class="m-label">Strategy</div>
             <div class="m-value">${b.strategy ?? '—'}</div>
           </div>
           <div>
-            <div class="m-label">Bankroll</div>
-            <div class="m-value">${fmt.money(caps.startingBalance ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Positions</div>
-            <div class="m-value">${b.totals?.openCount ?? 0} open · ${b.totals?.closedCount ?? 0} closed</div>
-          </div>
-          <div>
-            <div class="m-label">Realized P&amp;L</div>
-            <div class="m-value ${pnlClass(b.totals?.totalPnl ?? 0)}">${fmt.moneyPos(b.totals?.totalPnl ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Daily P&amp;L</div>
-            <div class="m-value ${pnlClass(b.daily?.dailyPnl ?? null)}">${fmt.moneyPos(b.daily?.dailyPnl ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Scans</div>
-            <div class="m-value">${b.totals?.scansCompleted ?? 0}</div>
-          </div>
-          <div>
-            <div class="m-label">Last saved</div>
-            <div class="m-value">${fmt.ago(b.totals?.savedAt)}</div>
-          </div>
-          <div>
-            <div class="m-label">Max positions</div>
-            <div class="m-value">${caps.maxTotalPositions ?? '—'}</div>
+            <div class="m-label">PID · last save</div>
+            <div class="m-value">${b.pid ?? '—'} · ${fmt.ago(t.savedAt)}</div>
           </div>
         </div>
       </div>

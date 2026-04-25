@@ -287,6 +287,26 @@ function botInfo(key: BotKey) {
   const closedToday = closedPositions.filter(p => (p.resolvedAt || "") >= todayStartIso);
   const todayPnl = closedToday.reduce((s, p) => s + (Number(p.pnl) || 0), 0);
 
+  // Per-bot performance metrics — derived from post-audit closedPositions
+  const wins = closedPositions.filter(p => (Number(p.pnl) || 0) > 0);
+  const losses = closedPositions.filter(p => (Number(p.pnl) || 0) < 0);
+  const winRate = closedPositions.length > 0 ? wins.length / closedPositions.length : null;
+  const avgWinUSD = wins.length > 0 ? wins.reduce((s, p) => s + p.pnl, 0) / wins.length : 0;
+  const avgLossUSD = losses.length > 0 ? losses.reduce((s, p) => s + p.pnl, 0) / losses.length : 0;
+  const winLossRatio = avgLossUSD < 0 ? Math.abs(avgWinUSD / avgLossUSD) : null;
+  const startingBalance = state?.config?.startingBalance ?? 0;
+  const realizedPnl = state?.totalPnl ?? 0;
+  const roiPct = startingBalance > 0 ? (realizedPnl / startingBalance) * 100 : null;
+  // Trades per day: number of closures over days-since-launch
+  const earliestClosure = closedPositions
+    .map(p => p.resolvedAt || p.entryTime)
+    .filter((t): t is string => !!t)
+    .sort()[0];
+  const daysSinceLaunch = earliestClosure
+    ? Math.max(0.5, (Date.now() - new Date(earliestClosure).getTime()) / 86400_000)
+    : 1;
+  const tradesPerDay = closedPositions.length / daysSinceLaunch;
+
   return {
     name: cfg.name,
     displayName: cfg.displayName,
@@ -325,11 +345,23 @@ function botInfo(key: BotKey) {
           deployed: state.deployed ?? 0,
           openCount: openPositions.length,
           closedCount: closedPositions.length,
-          wins: state.wins ?? 0,
-          losses: state.losses ?? 0,
+          wins: wins.length,
+          losses: losses.length,
           totalPnl: state.totalPnl ?? 0,
           scansCompleted: state.scansCompleted ?? 0,
           savedAt: state.savedAt ?? null,
+        }
+      : null,
+    // Per-bot performance metrics — derived from post-audit closedPositions
+    performance: state
+      ? {
+          winRate,                             // 0..1 (or null if no trades yet)
+          avgWinUSD: +avgWinUSD.toFixed(2),
+          avgLossUSD: +avgLossUSD.toFixed(2),
+          winLossRatio: winLossRatio != null ? +winLossRatio.toFixed(2) : null,
+          roiPct: roiPct != null ? +roiPct.toFixed(2) : null,
+          tradesPerDay: +tradesPerDay.toFixed(1),
+          daysSinceLaunch: +daysSinceLaunch.toFixed(1),
         }
       : null,
   };
@@ -571,7 +603,18 @@ app.get("/api/positions", async (c) => {
         };
       });
 
-      const withEV = positions.filter(p => p.expectedValueUSD != null);
+      // Filter Model EV to FAR-FROM-CLOSE positions only. Within ~12h of
+      // close the market has typically incorporated observed temperatures
+      // that the ensemble forecast hasn't seen, making model probabilities
+      // stale. Showing model EV for those positions led to wildly inflated
+      // numbers that confused more than they helped.
+      const MIN_HOURS_FOR_MODEL_EV = 12;
+      const withEV = positions.filter(p =>
+        p.expectedValueUSD != null && (p.hoursToClose ?? 0) >= MIN_HOURS_FOR_MODEL_EV
+      );
+      const stalePositions = positions.filter(p =>
+        p.expectedValueUSD != null && (p.hoursToClose ?? 0) < MIN_HOURS_FOR_MODEL_EV
+      );
       const pendingWins = positions.filter(p => p.settlementStatus === "pending-win");
       const pendingLosses = positions.filter(p => p.settlementStatus === "pending-loss");
       const summary = {
@@ -582,14 +625,17 @@ app.get("/api/positions", async (c) => {
         external: positions.filter(p => p.bot === "external").length,
         orphanExposureUSD: +positions.filter(p => p.bot === "orphan").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
         externalExposureUSD: +positions.filter(p => p.bot === "external").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
-        // Expected P&L across positions with forecast coverage
+        // Expected P&L across positions with forecast coverage AND
+        // far enough from close that the model is still informative.
         totalExpectedValueUSD: +withEV.reduce((s, p) => s + (p.expectedValueUSD ?? 0), 0).toFixed(2),
         positionsWithForecast: withEV.length,
-        // Optional: weighted model win-prob (capital-weighted)
+        // Capital-weighted average model win-prob across actionable positions
         avgModelProb: withEV.length
           ? +(withEV.reduce((s, p) => s + (p.modelProb ?? 0) * p.exposureUSD, 0) /
              Math.max(0.01, withEV.reduce((s, p) => s + p.exposureUSD, 0))).toFixed(4)
           : null,
+        // How many positions were excluded because model is stale
+        stalePositionsCount: stalePositions.length,
         // Pending-settlement totals — positions effectively decided but
         // not yet paid out by Kalshi
         pendingWinsCount: pendingWins.length,
