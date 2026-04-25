@@ -753,7 +753,7 @@ export class WeatherSimulator {
       // Allocate budget across ladder legs
       const availableBudget = Math.min(
         this.config.ladderBudget,
-        this.state.balance - this.state.deployed
+        this.state.balance
       );
       if (availableBudget < 2) continue;
 
@@ -778,7 +778,7 @@ export class WeatherSimulator {
         if (shares < 1) continue;
 
         let cost = shares * entryPrice;
-        if (cost > this.state.balance - this.state.deployed) continue;
+        if (cost > this.state.balance) continue;
 
         // ─── LIVE MODE: place real Kalshi order ───
         if (this.config.mode === "live" && this.executor) {
@@ -990,8 +990,11 @@ export class WeatherSimulator {
         continue;
       }
 
-      // Size + budget
-      const budget = Math.min(betSize, this.state.balance - this.state.deployed);
+      // Size + budget.
+      // `state.balance` is already free cash (net of deployed cost). Also cap total deployed
+      // at the configured startingBalance so the sim respects the same ceiling as the executor.
+      const remainingCap = Math.max(0, this.config.startingBalance - this.state.deployed);
+      const budget = Math.min(betSize, this.state.balance, remainingCap);
       const shares = Math.floor(budget / orderPrice);
       if (shares < 1) {
         this.log(`ENSEMBLE skip ${market.city} ${market.date}: insufficient budget`, "yellow");
@@ -1124,12 +1127,15 @@ export class WeatherSimulator {
 
       // Sizing — use max acceptable price (ask + slippage) as the budget ceiling.
       // The executor will fetch live orderbook and order at best ask if available.
+      // `state.balance` is already free cash (net of deployed cost); also cap total deployed
+      // at the configured startingBalance so the sim respects the same ceiling as the executor.
       const actualAsk = (favorite.bracket as any)._yesAsk ?? favorite.price;
       const orderPrice = Math.min(0.99, actualAsk + 0.03);  // up to 3¢ slippage tolerance
-      const budget = Math.min(betSize, this.state.balance - this.state.deployed);
+      const remainingCap = Math.max(0, this.config.startingBalance - this.state.deployed);
+      const budget = Math.min(betSize, this.state.balance, remainingCap);
       const shares = Math.floor(budget / orderPrice);
       if (shares < 1) {
-        this.log(`INTRINSIC skip ${market.city} ${market.date}: insufficient budget (ask $${actualAsk.toFixed(2)})`, "yellow");
+        this.log(`INTRINSIC skip ${market.city} ${market.date}: insufficient budget (ask $${actualAsk.toFixed(2)}, free cash $${this.state.balance.toFixed(2)}, cap remaining $${remainingCap.toFixed(2)})`, "yellow");
         continue;
       }
       let cost = shares * orderPrice;
@@ -1300,7 +1306,7 @@ export class WeatherSimulator {
       // 5. Size the snipe — single bracket, not a ladder
       const budget = Math.min(
         this.config.snipeBudget,
-        this.state.balance - this.state.deployed
+        this.state.balance
       );
       if (budget < 2) continue;
 
@@ -1312,7 +1318,7 @@ export class WeatherSimulator {
       const returnPct = ((1.0 / winPrice) - 1) * 100;
 
       // Ensure enough balance
-      if (cost > this.state.balance - this.state.deployed) continue;
+      if (cost > this.state.balance) continue;
 
       // 6. Fire the snipe
       const endDate = new Date(market.endDate);
