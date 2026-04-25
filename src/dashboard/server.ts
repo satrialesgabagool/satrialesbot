@@ -487,6 +487,25 @@ app.get("/api/positions", async (c) => {
 
         const { bot, orphanHint } = classifyPosition(p.ticker, avgEntryPrice, managed);
 
+        // Settlement classification — detects "effectively decided" positions
+        // where the market has converged so close to $0 or $1 that the outcome
+        // is essentially locked in but Kalshi hasn't paid out yet.
+        // For YES positions: mark ≥ $0.95 → pending-win, mark ≤ $0.05 → pending-loss.
+        // For NO positions: opposite.
+        // Pending-win expected payout uses the same fee-aware formula as the
+        // EV calculator: net = shares × (0.93 + 0.07 × entry).
+        let settlementStatus: "pending-win" | "pending-loss" | "active" = "active";
+        let pendingPayoutUSD = 0;
+        if (markPrice >= 0.95) {
+          settlementStatus = side === "yes" ? "pending-win" : "pending-loss";
+        } else if (markPrice <= 0.05) {
+          settlementStatus = side === "yes" ? "pending-loss" : "pending-win";
+        }
+        if (settlementStatus === "pending-win") {
+          // Net cash you'll receive after Kalshi's 7% winnings fee
+          pendingPayoutUSD = +(shares * (0.93 + 0.07 * avgEntryPrice)).toFixed(2);
+        }
+
         // Forecast enrichment: match this position's date against the ensemble
         // for its city, compute our bracket probability + expected value.
         const parsedTicker = parseEventTicker(m?.event_ticker ?? null);
@@ -546,10 +565,15 @@ app.get("/api/positions", async (c) => {
           expectedValuePerShareUSD,
           expectedValueUSD,
           forecast: forecastStats,
+          // Settlement awareness — surfaces "effectively decided" positions
+          settlementStatus,
+          pendingPayoutUSD,
         };
       });
 
       const withEV = positions.filter(p => p.expectedValueUSD != null);
+      const pendingWins = positions.filter(p => p.settlementStatus === "pending-win");
+      const pendingLosses = positions.filter(p => p.settlementStatus === "pending-loss");
       const summary = {
         managed: positions.filter(p => p.bot === "intrinsic" || p.bot === "ensemble").length,
         intrinsic: positions.filter(p => p.bot === "intrinsic").length,
@@ -566,6 +590,12 @@ app.get("/api/positions", async (c) => {
           ? +(withEV.reduce((s, p) => s + (p.modelProb ?? 0) * p.exposureUSD, 0) /
              Math.max(0.01, withEV.reduce((s, p) => s + p.exposureUSD, 0))).toFixed(4)
           : null,
+        // Pending-settlement totals — positions effectively decided but
+        // not yet paid out by Kalshi
+        pendingWinsCount: pendingWins.length,
+        pendingLossesCount: pendingLosses.length,
+        pendingPayoutUSD: +pendingWins.reduce((s, p) => s + (p.pendingPayoutUSD ?? 0), 0).toFixed(2),
+        pendingLossExposureUSD: +pendingLosses.reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
       };
 
       return { configured: true, positions, summary };

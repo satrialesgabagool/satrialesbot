@@ -88,6 +88,10 @@ td.num { text-align: right; }
 .tag-ensemble  { background: rgba(155,89,182,0.15); color: #c098d6; border: 1px solid rgba(155,89,182,0.3); }
 .tag-orphan    { background: rgba(243,156,18,0.15); color: #f5b867; border: 1px solid rgba(243,156,18,0.3); }
 .tag-external  { background: rgba(93,100,120,0.18); color: #a7aec2; border: 1px solid rgba(93,100,120,0.35); }
+.tag-pending-win   { background: rgba(46,204,113,0.18); color: #7dd9a4; border: 1px solid rgba(46,204,113,0.35); }
+.tag-pending-loss  { background: rgba(231,76,60,0.15); color: #f0a095; border: 1px solid rgba(231,76,60,0.3); }
+tr.pending-win  td { background: rgba(46,204,113,0.04); }
+tr.pending-loss td { background: rgba(231,76,60,0.03); }
 .tag-unknown   { background: var(--bg-elev); color: var(--text-dim); }
 .hint { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--text-mute); font-style: italic; }
 .summary-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 11px; color: var(--text-dim); margin-bottom: 10px; padding: 8px 10px; background: var(--bg-elev); border-radius: 5px; }
@@ -388,6 +392,21 @@ function renderTopCards() {
       <div class="value ${pnlClass(totalRealized + unrealized)}">${fmt.moneyPos(totalRealized + unrealized)}</div>
       <div class="sub">realized ${fmt.moneyPos(totalRealized)} · unreal ${fmt.moneyPos(unrealized)}</div>
     </div>
+    ${(() => {
+      const s = app.positionsSummary;
+      if (!s || (s.pendingWinsCount === 0 && s.pendingLossesCount === 0)) return '';
+      const wins = s.pendingWinsCount ?? 0;
+      const losses = s.pendingLossesCount ?? 0;
+      const payout = s.pendingPayoutUSD ?? 0;
+      const lossExp = s.pendingLossExposureUSD ?? 0;
+      return `
+        <div class="card" style="border-color:rgba(243,156,18,0.45);background:linear-gradient(180deg,rgba(243,156,18,0.05),var(--bg-card))">
+          <div class="label">⏳ Pending settlement</div>
+          <div class="value yellow">${fmt.money(payout)}</div>
+          <div class="sub">${wins} winner${wins===1?'':'s'} (~${fmt.money(payout)} into cash) · ${losses} loser${losses===1?'':'s'} (${fmt.money(lossExp)} written off)</div>
+        </div>
+      `;
+    })()}
     <div class="card">
       <div class="label">Session win rate</div>
       <div class="value">${wr == null ? '—' : fmt.pct0(wr)}</div>
@@ -592,9 +611,16 @@ function renderPositions() {
     // Effective model prob — if side is NO, the winning prob is 1 - bracketHitProb
     const winProb = p.modelProb == null ? null : (p.side === 'yes' ? p.modelProb : 1 - p.modelProb);
     const evClass = p.expectedValueUSD == null ? 'dim' : pnlClass(p.expectedValueUSD);
+    const settle = p.settlementStatus;
+    const rowCls = settle === 'pending-win' ? 'pending-win' : settle === 'pending-loss' ? 'pending-loss' : '';
+    const settleTag = settle === 'pending-win'
+      ? '<span class="tag tag-pending-win" title="Mark ≥ $0.95 — effectively a win, awaiting Kalshi settlement">⏳ pending win</span>'
+      : settle === 'pending-loss'
+      ? '<span class="tag tag-pending-loss" title="Mark ≤ $0.05 — effectively a loss, awaiting close">⏳ pending loss</span>'
+      : '';
     return `
-    <tr>
-      <td>${attributionTag(p)}</td>
+    <tr class="${rowCls}">
+      <td>${attributionTag(p)}${settleTag ? ' '+settleTag : ''}</td>
       <td><code style="font-size:11px">${p.ticker}</code></td>
       <td>${p.city ?? '—'}</td>
       <td>${p.bracketText ? '<span class="bracket">'+p.bracketText+'</span>' : '—'}</td>
