@@ -353,10 +353,27 @@ function renderTopCards() {
   const totalLosses = (intrinsicBot?.totals?.losses ?? 0) + (ensembleBot?.totals?.losses ?? 0);
   const wr = (totalWins + totalLosses) > 0 ? totalWins / (totalWins + totalLosses) : null;
 
-  const unrealized = app.positions.reduce((s, p) => s + (p.unrealizedPnlUSD ?? 0), 0);
+  // Two ways to compute "unrealized P&L":
+  //   - Bid-based: sum of (mark × shares − cost) per position. Optimistic
+  //     because bid × shares overstates exit value when bid sizes are thin,
+  //     and counts pending-settlement winners at full $0.99 mark.
+  //   - Kalshi-derived: portfolio_value − cash − cost. Matches Kalshi's own
+  //     marked-to-market accounting, which excludes decided-but-pending
+  //     winners until they actually settle. More conservative, more accurate
+  //     as a snapshot of "what's in your account right now."
+  const unrealizedBid = app.positions.reduce((s, p) => s + (p.unrealizedPnlUSD ?? 0), 0);
+  const unrealizedKalshi = (p?.configured && p?.portfolioValueUSD != null && p?.totalDeployedUSD != null)
+    ? (p.portfolioValueUSD - p.cashUSD - p.totalDeployedUSD)
+    : null;
+  const unrealized = unrealizedKalshi ?? unrealizedBid; // primary (used elsewhere too)
   const todayPnlI = intrinsicBot?.daily?.dailyPnl ?? 0;
   const todayPnlE = ensembleBot?.daily?.dailyPnl ?? 0;
   const todayPnl = todayPnlI + todayPnlE;
+  // Total P&L: realized (audit-corrected) + Kalshi-derived unrealized.
+  // We also expose the post-settlement projection (bid-based) since pending
+  // winners are real money that will land in cash within hours.
+  const totalPnlNow = totalRealized + (unrealizedKalshi ?? unrealizedBid);
+  const totalPnlPostSettle = totalRealized + unrealizedBid;
 
   const cashText = p?.configured ? fmt.money(p.cashUSD) : '—';
   const pvText = p?.configured ? fmt.money(p.portfolioValueUSD) : '—';
@@ -377,20 +394,20 @@ function renderTopCards() {
       <div class="value">${p?.configured ? fmt.money(p.totalDeployedUSD) : '—'}</div>
       <div class="sub">${p?.openPositionCount ?? 0} open positions</div>
     </div>
-    <div class="card">
-      <div class="label">Unrealized P&amp;L</div>
-      <div class="value ${pnlClass(unrealized)}">${fmt.moneyPos(unrealized)}</div>
-      <div class="sub">marked at bid</div>
+    <div class="card" title="Unrealized P&L if you exited at top-of-book bids right now. Optimistic when bid sizes are thin or when winners are decided-but-pending settlement.">
+      <div class="label">Unrealized (bid)</div>
+      <div class="value ${pnlClass(unrealizedBid)}">${fmt.moneyPos(unrealizedBid)}</div>
+      <div class="sub">${unrealizedKalshi != null ? `Kalshi-marked: <span class="${pnlClass(unrealizedKalshi)}">${fmt.moneyPos(unrealizedKalshi)}</span>` : 'marked at bid'}</div>
     </div>
     <div class="card">
       <div class="label">Today's P&amp;L</div>
       <div class="value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)}</div>
       <div class="sub">${(intrinsicBot?.daily?.closedToday ?? 0) + (ensembleBot?.daily?.closedToday ?? 0)} resolved · I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
     </div>
-    <div class="card">
-      <div class="label">Total P&amp;L</div>
-      <div class="value ${pnlClass(totalRealized + unrealized)}">${fmt.moneyPos(totalRealized + unrealized)}</div>
-      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · unreal ${fmt.moneyPos(unrealized)}</div>
+    <div class="card" title="Realized + Kalshi-marked unrealized = ground-truth current P&L. The 'post-settle' figure adds back pending winners at full mark — what total will be once Kalshi settles them.">
+      <div class="label">Total P&amp;L${unrealizedKalshi != null ? ' (Kalshi)' : ''}</div>
+      <div class="value ${pnlClass(totalPnlNow)}">${fmt.moneyPos(totalPnlNow)}</div>
+      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · ${unrealizedKalshi != null ? `post-settle ~<span class="${pnlClass(totalPnlPostSettle)}">${fmt.moneyPos(totalPnlPostSettle)}</span>` : `unreal ${fmt.moneyPos(unrealizedBid)}`}</div>
     </div>
     ${(() => {
       const s = app.positionsSummary;
