@@ -279,6 +279,14 @@ function botInfo(key: BotKey) {
   const openPositions: any[] = state?.positions ?? [];
   const closedPositions: any[] = state?.closedPositions ?? [];
 
+  // Compute "today's P&L" from resolved closures since local midnight.
+  // The daily tracker file only records orders placed, not P&L from
+  // resolutions — so we derive it here from post-audit closedPositions
+  // for a trustworthy number that updates the moment a position settles.
+  const todayStartIso = new Date(new Date().toDateString()).toISOString();
+  const closedToday = closedPositions.filter(p => (p.resolvedAt || "") >= todayStartIso);
+  const todayPnl = closedToday.reduce((s, p) => s + (Number(p.pnl) || 0), 0);
+
   return {
     name: cfg.name,
     displayName: cfg.displayName,
@@ -301,14 +309,16 @@ function botInfo(key: BotKey) {
           ensembleBetSize: state.config?.ensembleBetSize ?? null,
         }
       : null,
-    daily: tracker
-      ? {
-          date: tracker.date ?? null,
-          dailyPnl: tracker.dailyPnl ?? null,
-          firstOrderConfirmed: tracker.firstOrderConfirmed ?? null,
-          orderCount: tracker.orderCount ?? null,
-        }
-      : null,
+    daily: {
+      // dailyPnl is now computed from post-audit closedPositions resolved today,
+      // not from the tracker's never-updated realizedPnL field.
+      date: tracker?.date ?? new Date().toISOString().slice(0, 10),
+      dailyPnl: +todayPnl.toFixed(2),
+      closedToday: closedToday.length,
+      firstOrderConfirmed: tracker?.firstOrderConfirmed ?? null,
+      ordersPlaced: tracker?.ordersPlaced ?? null,
+      ordersFilled: tracker?.ordersFilled ?? null,
+    },
     totals: state
       ? {
           balance: state.balance ?? 0,
@@ -743,30 +753,37 @@ app.get("/api/trades", (c) => {
 });
 
 // ─── Equity curve ─────────────────────────────────────────────────────
-// Returns THREE series so the UI can toggle what it shows:
-//   1. kalshi        — ground-truth account value over time (logged by this
-//                      server every ~10 min while running)
-//   2. intrinsicPnl  — cumulative realized P&L from the intrinsic bot's CSV
-//   3. ensemblePnl   — cumulative realized P&L from the ensemble bot's CSV
-//   4. combinedPnl   — combined cumulative P&L across both bots (merged by time)
+// Returns several series so the UI can toggle what it shows:
+//   kalshi       — ground-truth Kalshi balance snapshots logged by this
+//                  server every ~10 min while running
+//   intrinsicPnl — cumulative realized P&L from the intrinsic bot
+//   ensemblePnl  — cumulative realized P&L from the ensemble bot
+//   combinedPnl  — both bots summed over time (merged by resolvedAt)
 //
-// Cumulative P&L is computed by summing the `pnl` column row-by-row. Since
-// pnl is a per-trade realized figure (independent of the simulator's
-// internal balance), this stitches cleanly across --fresh restarts.
+// Cumulative P&L is derived from the bot state's `closedPositions[]`, which
+// is the POST-AUDIT source of truth. (Earlier versions read the CSV
+// directly, but when the simulator's startup audit corrects classifications
+// against Kalshi's actual settlement results, it only updates the state file
+// — the historical CSV rows keep their original (pre-audit) values. Reading
+// state.closedPositions guarantees the chart always reflects corrected P&L.)
 
-function cumulativePnlFromCsv(path: string, bot: BotKey): Array<{ t: string; value: number }> {
-  const rows = parseCsv(path, bot);
-  rows.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+function cumulativePnlFromState(statePath: string): Array<{ t: string; value: number }> {
+  const s = readJson(statePath);
+  const closed: any[] = s?.closedPositions ?? [];
+  const sorted = closed
+    .map(p => ({ t: p.resolvedAt || p.entryTime || null, pnl: Number(p.pnl) || 0 }))
+    .filter(p => p.t != null)
+    .sort((a, b) => a.t!.localeCompare(b.t!));
   let acc = 0;
-  return rows.map(r => {
+  return sorted.map(r => {
     acc += r.pnl;
-    return { t: r.timestamp, value: +acc.toFixed(4) };
+    return { t: r.t as string, value: +acc.toFixed(4) };
   });
 }
 
 app.get("/api/equity", (c) => {
-  const intrinsicPnl = cumulativePnlFromCsv(BOTS.intrinsic.tradesPath, "intrinsic");
-  const ensemblePnl = cumulativePnlFromCsv(BOTS.ensemble.tradesPath, "ensemble");
+  const intrinsicPnl = cumulativePnlFromState(BOTS.intrinsic.statePath);
+  const ensemblePnl = cumulativePnlFromState(BOTS.ensemble.statePath);
 
   // Combined: merge both bots by timestamp, carry forward each bot's running total
   const allEvents = [

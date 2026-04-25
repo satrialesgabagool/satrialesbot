@@ -381,12 +381,17 @@ function renderTopCards() {
     <div class="card">
       <div class="label">Today's P&amp;L</div>
       <div class="value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)}</div>
-      <div class="sub">I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
+      <div class="sub">${(intrinsicBot?.daily?.closedToday ?? 0) + (ensembleBot?.daily?.closedToday ?? 0)} resolved · I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
+    </div>
+    <div class="card">
+      <div class="label">Total P&amp;L</div>
+      <div class="value ${pnlClass(totalRealized + unrealized)}">${fmt.moneyPos(totalRealized + unrealized)}</div>
+      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · unreal ${fmt.moneyPos(unrealized)}</div>
     </div>
     <div class="card">
       <div class="label">Session win rate</div>
       <div class="value">${wr == null ? '—' : fmt.pct0(wr)}</div>
-      <div class="sub">${totalWins}W · ${totalLosses}L · realized ${fmt.moneyPos(totalRealized)}</div>
+      <div class="sub">${totalWins}W · ${totalLosses}L</div>
     </div>
     <div class="card">
       <div class="label">Expected P&amp;L (model)</div>
