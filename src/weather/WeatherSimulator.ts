@@ -151,10 +151,22 @@ export interface SimulatorConfig {
   ensembleWindowHours?: number;
   /** Min ensemble probability to bet (default 0.40) */
   ensembleMinProb?: number;
-  /** Max entry price in dollars (default 0.50) */
+  /** Max entry price in dollars (default 0.30 — entries above this lose
+   *  reliably per live data; the cheapest brackets carry the strategy) */
   ensembleMaxPrice?: number;
-  /** Budget per bet (default 10) */
+  /** Min entry price in dollars (default 0.07 — entries below this are
+   *  lottery tickets that historically don't hit; the win rate at sub-5¢
+   *  was 0/4 in early live data) */
+  ensembleMinPrice?: number;
+  /** Budget per bet (default 10). Actual bet size is multiplied by the
+   *  high-confidence multiplier when edge is large; see ensembleHighConfMult. */
   ensembleBetSize?: number;
+  /** Multiplier applied to ensembleBetSize when edge ≥ ensembleHighConfEdge.
+   *  Default 1.5 — bets 50% more capital on high-conviction setups.
+   *  Always still capped by KalshiExecutor's maxPerOrderUSD. */
+  ensembleHighConfMult?: number;
+  /** Edge threshold above which the high-conf multiplier kicks in (default 0.30) */
+  ensembleHighConfEdge?: number;
 
   // ─── Persistence overrides (for running multiple bots in parallel) ─
   /** Custom state file path (defaults to state/weather-sim.json) */
@@ -216,12 +228,18 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   intrinsicMaxPrice: 0.95,
   intrinsicMinGap: 0.05,
   intrinsicBetSize: 3,
-  // Ensemble-forecast defaults
+  // Ensemble-forecast defaults — calibrated against early live data:
+  // - maxPrice 0.30: entries $0.30+ lost 5/6 in first 16 trades
+  // - minPrice 0.07: entries below 5¢ won 0/4 (too far OOM)
+  // - highConfMult 1.5: edge≥30% trades had 50% WR / +390% ROI vs baseline 25%/+36%
   ensembleHoursBefore: 24,
   ensembleWindowHours: 12,
   ensembleMinProb: 0.40,
-  ensembleMaxPrice: 0.50,
+  ensembleMaxPrice: 0.30,
+  ensembleMinPrice: 0.07,
   ensembleBetSize: 10,
+  ensembleHighConfMult: 1.5,
+  ensembleHighConfEdge: 0.30,
 };
 
 const RESULTS_DIR = join(import.meta.dir, "../../results");
@@ -914,8 +932,11 @@ export class WeatherSimulator {
     const targetH = this.config.ensembleHoursBefore ?? 24;
     const windowH = this.config.ensembleWindowHours ?? 12;
     const minProb = this.config.ensembleMinProb ?? 0.40;
-    const maxPrice = this.config.ensembleMaxPrice ?? 0.50;
+    const maxPrice = this.config.ensembleMaxPrice ?? 0.30;
+    const minPrice = this.config.ensembleMinPrice ?? 0.07;
     const betSize = this.config.ensembleBetSize ?? 10;
+    const highConfMult = this.config.ensembleHighConfMult ?? 1.5;
+    const highConfEdge = this.config.ensembleHighConfEdge ?? 0.30;
 
     const highMarkets = markets.filter(m => m.type === "high");
     let fired = 0;
@@ -984,17 +1005,39 @@ export class WeatherSimulator {
         continue;
       }
 
-      // Filter: max price (key — we want cheap entries)
+      // Filter: max price (key — we want cheap entries; mid-price entries
+      // had 0% WR in early live data)
       if (orderPrice > maxPrice) {
         this.log(`ENSEMBLE skip ${market.city} ${market.date}: order price $${orderPrice.toFixed(2)} > $${maxPrice.toFixed(2)} max (pick ${this.bracketLabel(bestBracket)} at ${(probability * 100).toFixed(0)}% prob)`, "dim");
         continue;
       }
 
+      // Filter: min price (lottery-ticket floor — entries below 7¢ won 0/4 in
+      // early live data; even at 60% model prob, the bid being that cheap
+      // means the market knows something)
+      if (orderPrice < minPrice) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date}: order price $${orderPrice.toFixed(2)} < $${minPrice.toFixed(2)} min (pick ${this.bracketLabel(bestBracket)})`, "dim");
+        continue;
+      }
+
+      // Confidence-tiered sizing: edge = modelProb − implied. Above the
+      // high-conviction threshold, scale the bet up. The 30-40% edge bucket
+      // had 50% WR / +390% ROI in early data — significantly better than the
+      // 25% WR / +36% ROI baseline. Below threshold uses base size.
+      // KalshiExecutor's maxPerOrderUSD still caps the absolute upper bound.
+      const edge = probability - orderPrice;
+      const sizeMultiplier = edge >= highConfEdge ? highConfMult : 1.0;
+      const adjustedBetSize = +(betSize * sizeMultiplier).toFixed(2);
+      if (sizeMultiplier > 1.0) {
+        this.log(`ENSEMBLE high-conf ${market.city} ${market.date}: edge ${(edge * 100).toFixed(0)}% ≥ ${(highConfEdge * 100).toFixed(0)}% — sizing ${sizeMultiplier.toFixed(1)}× = $${adjustedBetSize.toFixed(2)}`, "magenta");
+      }
+
       // Size + budget.
       // `state.balance` is already free cash (net of deployed cost). Also cap total deployed
       // at the configured startingBalance so the sim respects the same ceiling as the executor.
+      // Use adjustedBetSize so high-conviction setups deploy more capital.
       const remainingCap = Math.max(0, this.config.startingBalance - this.state.deployed);
-      const budget = Math.min(betSize, this.state.balance, remainingCap);
+      const budget = Math.min(adjustedBetSize, this.state.balance, remainingCap);
       const shares = Math.floor(budget / orderPrice);
       if (shares < 1) {
         this.log(`ENSEMBLE skip ${market.city} ${market.date}: insufficient budget`, "yellow");

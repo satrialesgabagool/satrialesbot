@@ -40,13 +40,20 @@ const USE_DEMO = hasFlag("--demo");
 const I_UNDERSTAND = hasFlag("--i-understand");
 const FRESH = hasFlag("--fresh");
 
-// Tight defaults for ensemble strategy on $100 bankroll
+// Tight defaults for ensemble strategy on $100 bankroll. Tuned 2026-04-26
+// based on first 16 closed trades:
+//   maxPrice 0.30 (was 0.50): mid-price entries lost reliably (0/6 above 0.30)
+//   minPrice 0.07 (new):      sub-7¢ "lottery tickets" hit 0/4, drag on returns
+//   highConfMult 1.5 (new):   30%+ edge had 50% WR / +390% ROI vs 25% baseline
 const MAX_DEPLOYED_USD = argVal("--max-deployed", 100);
 const MAX_PER_ORDER_USD = argVal("--max-per-order", 15);
 const DAILY_LOSS_CAP_USD = -Math.abs(argVal("--daily-loss", 30));
 const BET_SIZE = argVal("--bet-size", 10);
 const MIN_PROB = argVal("--min-prob", 0.40);
-const MAX_PRICE = argVal("--max-price", 0.50);
+const MAX_PRICE = argVal("--max-price", 0.30);
+const MIN_PRICE = argVal("--min-price", 0.07);
+const HIGH_CONF_MULT = argVal("--high-conf-mult", 1.5);
+const HIGH_CONF_EDGE = argVal("--high-conf-edge", 0.30);
 const ENTRY_HOURS = argVal("--entry-hours", 24);
 const WINDOW_HOURS = argVal("--window-hours", 12);
 const SCAN_INTERVAL_MIN = argVal("--scan-interval", 5);
@@ -119,9 +126,10 @@ ${c.magenta}${c.bold}  ╔══════════════════
   ${c.dim}Max deployed:${c.reset}      ${c.bold}$${MAX_DEPLOYED_USD.toFixed(2)}${c.reset}
   ${c.dim}Max per order:${c.reset}     ${c.bold}$${MAX_PER_ORDER_USD.toFixed(2)}${c.reset}
   ${c.dim}Daily loss cap:${c.reset}    ${c.bold}-$${Math.abs(DAILY_LOSS_CAP_USD).toFixed(2)}${c.reset}
-  ${c.dim}Bet size:${c.reset}          $${BET_SIZE.toFixed(2)}
+  ${c.dim}Bet size (base):${c.reset}   $${BET_SIZE.toFixed(2)}
+  ${c.dim}High-conf size:${c.reset}    $${(BET_SIZE * HIGH_CONF_MULT).toFixed(2)} ${c.dim}(${HIGH_CONF_MULT.toFixed(1)}× when edge ≥ ${(HIGH_CONF_EDGE*100).toFixed(0)}%)${c.reset}
   ${c.dim}Min ensemble prob:${c.reset} ${(MIN_PROB * 100).toFixed(0)}%
-  ${c.dim}Max entry price:${c.reset}   $${MAX_PRICE.toFixed(2)}
+  ${c.dim}Entry price band:${c.reset}  $${MIN_PRICE.toFixed(2)} – $${MAX_PRICE.toFixed(2)}
   ${c.dim}Entry window:${c.reset}      ${ENTRY_HOURS}h ± ${WINDOW_HOURS}h before close
   ${c.dim}Scan interval:${c.reset}     ${SCAN_INTERVAL_MIN} min
   ${c.dim}State file:${c.reset}        ${STATE_PATH}
@@ -207,7 +215,10 @@ async function main() {
     ensembleWindowHours: WINDOW_HOURS,
     ensembleMinProb: MIN_PROB,
     ensembleMaxPrice: MAX_PRICE,
+    ensembleMinPrice: MIN_PRICE,
     ensembleBetSize: BET_SIZE,
+    ensembleHighConfMult: HIGH_CONF_MULT,
+    ensembleHighConfEdge: HIGH_CONF_EDGE,
     snipeEnabled: false,
     snipeMaxPrice: 0.92, snipeBudget: 5, snipeMinConfidence: "likely_final",
     // Isolated paths
