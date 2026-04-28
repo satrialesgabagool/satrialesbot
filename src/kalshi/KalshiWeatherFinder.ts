@@ -56,6 +56,15 @@ export const KALSHI_WEATHER_CITIES: KalshiWeatherCity[] = [
   { seriesTicker: "KXHIGHDC",  city: "Washington DC", lat: 38.8514, lon: -77.0377, nwsWfo: "lwx" },  // Reagan (KDCA)
 ];
 
+/**
+ * Daily-LOW temperature series — same cities as the highs.
+ * Generated programmatically to keep the two lists in sync.
+ */
+export const KALSHI_WEATHER_LOW_CITIES: KalshiWeatherCity[] = KALSHI_WEATHER_CITIES.map(c => ({
+  ...c,
+  seriesTicker: c.seriesTicker.replace(/^KXHIGH/, "KXLOW"),
+}));
+
 // Singleton client for market data (no auth needed)
 let _client: KalshiClient | null = null;
 
@@ -206,6 +215,8 @@ export interface FindKalshiWeatherOptions {
   daysAhead?: number;
   /** Use demo API (default false — demo may have fewer markets) */
   demo?: boolean;
+  /** Also include daily-LOW temp markets (KXLOW*). Default false for back-compat. */
+  includeLows?: boolean;
 }
 
 /**
@@ -219,7 +230,9 @@ export async function findKalshiWeatherMarkets(
   const results: WeatherMarket[] = [];
 
   // Determine which series to query
-  let seriesToQuery = KALSHI_WEATHER_CITIES;
+  let seriesToQuery = options?.includeLows
+    ? [...KALSHI_WEATHER_CITIES, ...KALSHI_WEATHER_LOW_CITIES]
+    : KALSHI_WEATHER_CITIES;
   if (options?.city) {
     seriesToQuery = seriesToQuery.filter(
       c => c.city.toLowerCase().includes(options!.city!.toLowerCase())
@@ -291,6 +304,10 @@ export async function findKalshiWeatherMarkets(
       // Find close time from first market
       const closeTime = markets[0]?.close_time ?? event.strike_date ?? "";
 
+      // Detect KXHIGH vs KXLOW from the event ticker; brackets and bot logic
+      // are otherwise identical.
+      const marketType: "high" | "low" = event.event_ticker.startsWith("KXLOW") ? "low" : "high";
+
       results.push({
         eventId: event.event_ticker,
         title: event.title,
@@ -300,7 +317,7 @@ export async function findKalshiWeatherMarkets(
         endDate: closeTime,
         brackets,
         unit: "F",
-        type: "high",   // Kalshi KXHIGH = daily high temp
+        type: marketType,
       });
     }
   }

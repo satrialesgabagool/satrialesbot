@@ -168,6 +168,29 @@ export interface SimulatorConfig {
   /** Edge threshold above which the high-conf multiplier kicks in (default 0.30) */
   ensembleHighConfEdge?: number;
 
+  // ─── Multi-bracket ladder mode (opt-in) ──────────────────────────
+  /** Number of brackets per event to bet on. 1 (default) = single-bracket
+   *  (current behavior). 2-3 = ladder mode that splits the bet across the
+   *  top N highest-probability brackets. Backtest evidence suggests +13-17pp
+   *  ROI lift at top-3 vs top-1 with prob-weighted sizing. */
+  ensembleLadderTopN?: number;
+  /** Min probability for a non-top pick to qualify in ladder mode. The top
+   *  pick still uses ensembleMinProb. Default 0.20 — letting the rank-2/3
+   *  bracket qualify even when its prob is well below the top pick's. */
+  ensembleLadderMinProb?: number;
+  /** Sizing scheme across the top-N picks:
+   *    "even"          → equal split (e.g. 50/50 for n=2)
+   *    "front-loaded"  → preset (60/40 for n=2, 50/30/20 for n=3)
+   *    "weighted"      → split proportional to model probabilities
+   *  Default "weighted". */
+  ensembleLadderSizing?: "even" | "front-loaded" | "weighted";
+
+  // ─── KXLOW (daily-low-temp) markets opt-in ──────────────────────
+  /** Include KXLOW (daily-low) markets alongside KXHIGH. Default false.
+   *  When enabled, the simulator queries both market types and dispatches
+   *  to lowF_members vs highF_members based on each market's `type` field. */
+  ensembleIncludeLows?: boolean;
+
   // ─── Persistence overrides (for running multiple bots in parallel) ─
   /** Custom state file path (defaults to state/weather-sim.json) */
   stateFilePath?: string;
@@ -240,6 +263,13 @@ const DEFAULT_CONFIG: SimulatorConfig = {
   ensembleBetSize: 10,
   ensembleHighConfMult: 1.5,
   ensembleHighConfEdge: 0.30,
+  // Multi-bracket ladder defaults — OFF by default, current single-bracket
+  // behavior preserved. Set ensembleLadderTopN ≥ 2 to opt in.
+  ensembleLadderTopN: 1,
+  ensembleLadderMinProb: 0.20,
+  ensembleLadderSizing: "weighted" as const,
+  // KXLOW expansion — OFF by default for back-compat.
+  ensembleIncludeLows: false,
 };
 
 const RESULTS_DIR = join(import.meta.dir, "../../results");
@@ -937,32 +967,49 @@ export class WeatherSimulator {
     const betSize = this.config.ensembleBetSize ?? 10;
     const highConfMult = this.config.ensembleHighConfMult ?? 1.5;
     const highConfEdge = this.config.ensembleHighConfEdge ?? 0.30;
+    const ladderTopN = Math.max(1, this.config.ensembleLadderTopN ?? 1);
+    const ladderMinProb = this.config.ensembleLadderMinProb ?? 0.20;
+    const ladderSizing = this.config.ensembleLadderSizing ?? "weighted";
+    const includeLows = this.config.ensembleIncludeLows ?? false;
 
-    const highMarkets = markets.filter(m => m.type === "high");
+    // Process both KXHIGH and (optionally) KXLOW markets. Dispatched per-market
+    // to the right ensemble member set based on type.
+    const eligibleMarkets = markets.filter(
+      m => m.type === "high" || (includeLows && m.type === "low"),
+    );
     let fired = 0;
 
-    for (const market of highMarkets) {
-      const key = `ensemble-${market.city.toLowerCase()}-${market.date}`;
+    for (const market of eligibleMarkets) {
+      // Include market.type in the dedup key so KXHIGH and KXLOW for the same
+      // city+date are treated as separate fire targets.
+      const key = `ensemble-${market.city.toLowerCase()}-${market.date}-${market.type}`;
       if (this.ensembleFiredKeys.has(key)) continue;
 
       const hoursToClose = (new Date(market.endDate).getTime() - now) / (1000 * 60 * 60);
       if (hoursToClose < targetH - windowH || hoursToClose > targetH + windowH) continue;
 
-      // Fetch the 82-member ensemble forecast for this city+date
+      // Fetch the 82-member ensemble forecast for this city
       const ensemble = await fetchEnsembleForecast(market.city, 3);
       if (!ensemble) {
-        this.log(`ENSEMBLE skip ${market.city}: forecast fetch failed`, "dim");
+        this.log(`ENSEMBLE skip ${market.city} ${market.type}: forecast fetch failed`, "dim");
         continue;
       }
       const dayForecast = ensemble.forecasts.find(f => f.date === market.date);
-      if (!dayForecast || !dayForecast.highFMembers || dayForecast.highFMembers.length < 20) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: no member data (${dayForecast?.highFMembers?.length ?? 0} members)`, "dim");
+      if (!dayForecast) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type}: no day forecast`, "dim");
+        continue;
+      }
+      // Dispatch member array: highFMembers for KXHIGH, lowFMembers for KXLOW
+      const members = market.type === "low" ? dayForecast.lowFMembers : dayForecast.highFMembers;
+      const memberMean = market.type === "low" ? dayForecast.ensembleLowF : dayForecast.ensembleHighF;
+      const memberSpread = market.type === "low" ? dayForecast.spreadLowF : dayForecast.spreadHighF;
+      if (!members || members.length < 20) {
+        this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type}: no member data (${members?.length ?? 0})`, "dim");
         continue;
       }
 
       // Count members per bracket (using NWS rounding convention)
       const counts = new Map<string, number>();
-      const members = dayForecast.highFMembers;
       let totalValid = 0;
       for (const temp of members) {
         if (typeof temp !== "number" || !isFinite(temp)) continue;
@@ -979,123 +1026,156 @@ export class WeatherSimulator {
         }
       }
       if (totalValid === 0) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: members don't match any bracket`, "yellow");
+        this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type}: members don't match any bracket`, "yellow");
         continue;
       }
 
-      // Find bracket with highest probability
-      let bestTicker: string | null = null;
-      let bestCount = 0;
-      for (const [ticker, count] of counts) {
-        if (count > bestCount) { bestTicker = ticker; bestCount = count; }
+      // Rank ALL brackets by probability (highest first). Single-bracket mode
+      // takes only [0]; ladder mode takes top-N with relaxed minProb floor.
+      const ranked = [...counts.entries()]
+        .map(([ticker, count]) => {
+          const bracket = market.brackets.find(b => ((b as any)._kalshiTicker || (b as any).slug) === ticker);
+          return bracket ? { ticker, count, bracket, probability: count / totalValid } : null;
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null)
+        .sort((a, b) => b.probability - a.probability);
+
+      // Apply per-pick filters:
+      //   - Top-1 must clear `minProb` (the historical 0.40 default)
+      //   - Subsequent picks (in ladder mode) must clear the looser `ladderMinProb`
+      //   - All picks must have entry price within [minPrice, maxPrice]
+      const candidates: Array<{
+        ticker: string;
+        bracket: any;
+        probability: number;
+        orderPrice: number;
+        midPrice: number;
+      }> = [];
+      for (let i = 0; i < ranked.length && candidates.length < ladderTopN; i++) {
+        const r = ranked[i];
+        const requiredProb = i === 0 ? minProb : ladderMinProb;
+        if (r.probability < requiredProb) {
+          if (i === 0) {
+            this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type}: top prob ${(r.probability * 100).toFixed(0)}% < ${(minProb * 100).toFixed(0)}% (pick ${this.bracketLabel(r.bracket)})`, "dim");
+          }
+          break; // ranks are sorted, so once below threshold we stop
+        }
+        const midPrice = r.bracket.outcomePrices[0];
+        const actualAsk = (r.bracket as any)._yesAsk ?? midPrice;
+        const orderPrice = Math.min(0.99, actualAsk + 0.03);
+        if (orderPrice > maxPrice) {
+          this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type} rank-${i + 1}: $${orderPrice.toFixed(2)} > $${maxPrice.toFixed(2)} max`, "dim");
+          continue;
+        }
+        if (orderPrice < minPrice) {
+          this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type} rank-${i + 1}: $${orderPrice.toFixed(2)} < $${minPrice.toFixed(2)} min`, "dim");
+          continue;
+        }
+        candidates.push({ ticker: r.ticker, bracket: r.bracket, probability: r.probability, orderPrice, midPrice });
       }
-      if (!bestTicker) continue;
+      if (candidates.length === 0) continue;
 
-      const probability = bestCount / totalValid;
-      const bestBracket = market.brackets.find(b => ((b as any)._kalshiTicker || (b as any).slug) === bestTicker);
-      if (!bestBracket) continue;
+      // Allocate budget across candidates per sizing scheme. Each candidate
+      // independently gets the high-conf multiplier if its own edge ≥ threshold.
+      const allocations = (() => {
+        const n = candidates.length;
+        if (n === 1) return [betSize];
+        if (ladderSizing === "even") return Array(n).fill(betSize / n);
+        if (ladderSizing === "front-loaded") {
+          const presets: Record<number, number[]> = {
+            2: [0.60, 0.40],
+            3: [0.50, 0.30, 0.20],
+            4: [0.40, 0.25, 0.20, 0.15],
+          };
+          const weights = presets[n] ?? Array(n).fill(1 / n);
+          return weights.map(w => betSize * w);
+        }
+        // weighted: split proportional to model probability
+        const totalProb = candidates.reduce((s, c) => s + c.probability, 0);
+        return candidates.map(c => betSize * (c.probability / Math.max(0.001, totalProb)));
+      })();
 
-      const midPrice = bestBracket.outcomePrices[0];
-      const actualAsk = (bestBracket as any)._yesAsk ?? midPrice;
-      const orderPrice = Math.min(0.99, actualAsk + 0.03);
-
-      // Filter: min probability
-      if (probability < minProb) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: prob ${(probability * 100).toFixed(0)}% < ${(minProb * 100).toFixed(0)}% (pick: ${this.bracketLabel(bestBracket)})`, "dim");
-        continue;
-      }
-
-      // Filter: max price (key — we want cheap entries; mid-price entries
-      // had 0% WR in early live data)
-      if (orderPrice > maxPrice) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: order price $${orderPrice.toFixed(2)} > $${maxPrice.toFixed(2)} max (pick ${this.bracketLabel(bestBracket)} at ${(probability * 100).toFixed(0)}% prob)`, "dim");
-        continue;
-      }
-
-      // Filter: min price (lottery-ticket floor — entries below 7¢ won 0/4 in
-      // early live data; even at 60% model prob, the bid being that cheap
-      // means the market knows something)
-      if (orderPrice < minPrice) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: order price $${orderPrice.toFixed(2)} < $${minPrice.toFixed(2)} min (pick ${this.bracketLabel(bestBracket)})`, "dim");
-        continue;
-      }
-
-      // Confidence-tiered sizing: edge = modelProb − implied. Above the
-      // high-conviction threshold, scale the bet up. The 30-40% edge bucket
-      // had 50% WR / +390% ROI in early data — significantly better than the
-      // 25% WR / +36% ROI baseline. Below threshold uses base size.
-      // KalshiExecutor's maxPerOrderUSD still caps the absolute upper bound.
-      const edge = probability - orderPrice;
-      const sizeMultiplier = edge >= highConfEdge ? highConfMult : 1.0;
-      const adjustedBetSize = +(betSize * sizeMultiplier).toFixed(2);
-      if (sizeMultiplier > 1.0) {
-        this.log(`ENSEMBLE high-conf ${market.city} ${market.date}: edge ${(edge * 100).toFixed(0)}% ≥ ${(highConfEdge * 100).toFixed(0)}% — sizing ${sizeMultiplier.toFixed(1)}× = $${adjustedBetSize.toFixed(2)}`, "magenta");
-      }
-
-      // Size + budget.
-      // `state.balance` is already free cash (net of deployed cost). Also cap total deployed
-      // at the configured startingBalance so the sim respects the same ceiling as the executor.
-      // Use adjustedBetSize so high-conviction setups deploy more capital.
-      const remainingCap = Math.max(0, this.config.startingBalance - this.state.deployed);
-      const budget = Math.min(adjustedBetSize, this.state.balance, remainingCap);
-      const shares = Math.floor(budget / orderPrice);
-      if (shares < 1) {
-        this.log(`ENSEMBLE skip ${market.city} ${market.date}: insufficient budget`, "yellow");
-        continue;
-      }
-      let cost = shares * orderPrice;
-      let entryPrice = orderPrice;
-      let filledShares = shares;
-
-      // Live mode: place real order
-      if (this.config.mode === "live" && this.executor) {
-        const result = await this.executor.placeOrder({
-          ticker: bestTicker,
-          side: "yes",
-          askPrice: orderPrice,
-          maxShares: shares,
-          budget,
-        });
-        if (!result.success) continue;
-        filledShares = result.filledShares;
-        entryPrice = result.avgPriceDollars;
-        cost = result.filledCostUSD;
+      if (ladderTopN > 1 && candidates.length > 1) {
+        this.log(
+          `🪜 ENSEMBLE LADDER ${market.city} ${market.date} ${market.type}: ${candidates.length} picks (${candidates.map((c, i) => `${this.bracketLabel(c.bracket)} ${(c.probability * 100).toFixed(0)}% $${allocations[i].toFixed(2)}`).join(", ")})`,
+          "magenta",
+        );
       }
 
-      const pos: WeatherPosition = {
-        id: `WP-${++this.positionCounter}`,
-        market,
-        bracket: bestBracket,
-        shares: filledShares,
-        entryPrice,
-        cost,
-        forecastTempF: dayForecast.ensembleHighF,
-        forecastProb: probability,
-        edge: probability - midPrice,
-        modelSpreadF: dayForecast.spreadHighF,
-        modelCount: dayForecast.modelCount,
-        hoursToResolution: hoursToClose,
-        entryTime: new Date().toISOString(),
-        status: "open",
-        pnl: 0,
-        ladderGroup: `ensemble-${market.city}-${market.date}`,
-      };
+      // Place each pick as an independent order.
+      let placedAny = false;
+      for (let i = 0; i < candidates.length; i++) {
+        const pick = candidates[i];
+        const baseAlloc = allocations[i];
+        const edge = pick.probability - pick.orderPrice;
+        const sizeMultiplier = edge >= highConfEdge ? highConfMult : 1.0;
+        const targetSize = +(baseAlloc * sizeMultiplier).toFixed(2);
 
-      this.state.positions.push(pos);
-      this.state.deployed += cost;
-      this.state.balance -= cost;
-      this.ensembleFiredKeys.add(key);
-      this.activeLadderKeys.add(`${market.city.toLowerCase()}-${market.date}-${market.type}`);
-      this.logTrade("ENSEMBLE", pos);
-      this.onPositionOpened?.(pos);
-      fired++;
+        const remainingCap = Math.max(0, this.config.startingBalance - this.state.deployed);
+        const budget = Math.min(targetSize, this.state.balance, remainingCap);
+        const shares = Math.floor(budget / pick.orderPrice);
+        if (shares < 1) {
+          this.log(`ENSEMBLE skip ${market.city} ${market.date} ${market.type} rank-${i + 1}: insufficient budget`, "yellow");
+          continue;
+        }
+        if (sizeMultiplier > 1.0) {
+          this.log(`ENSEMBLE high-conf ${market.city} ${market.date} ${market.type} rank-${i + 1}: edge ${(edge * 100).toFixed(0)}% ≥ ${(highConfEdge * 100).toFixed(0)}% — sizing ${sizeMultiplier.toFixed(1)}× = $${targetSize.toFixed(2)}`, "magenta");
+        }
+        let cost = shares * pick.orderPrice;
+        let entryPrice = pick.orderPrice;
+        let filledShares = shares;
 
-      this.log(
-        `🔬 ENSEMBLE ${market.city} ${market.date}: ${this.bracketLabel(bestBracket)} @ $${entryPrice.toFixed(2)} ` +
-        `(prob ${(probability * 100).toFixed(0)}%, ${filledShares}sh, $${cost.toFixed(2)}, ` +
-        `${hoursToClose.toFixed(1)}h to close, ens_high=${dayForecast.ensembleHighF.toFixed(0)}°F)`,
-        "green"
-      );
+        if (this.config.mode === "live" && this.executor) {
+          const result = await this.executor.placeOrder({
+            ticker: pick.ticker,
+            side: "yes",
+            askPrice: pick.orderPrice,
+            maxShares: shares,
+            budget,
+          });
+          if (!result.success) continue;
+          filledShares = result.filledShares;
+          entryPrice = result.avgPriceDollars;
+          cost = result.filledCostUSD;
+        }
+
+        const pos: WeatherPosition = {
+          id: `WP-${++this.positionCounter}`,
+          market,
+          bracket: pick.bracket,
+          shares: filledShares,
+          entryPrice,
+          cost,
+          forecastTempF: memberMean,
+          forecastProb: pick.probability,
+          edge: pick.probability - pick.midPrice,
+          modelSpreadF: memberSpread,
+          modelCount: dayForecast.modelCount,
+          hoursToResolution: hoursToClose,
+          entryTime: new Date().toISOString(),
+          status: "open",
+          pnl: 0,
+          ladderGroup: `ensemble-${market.city}-${market.date}-${market.type}`,
+        };
+        this.state.positions.push(pos);
+        this.state.deployed += cost;
+        this.state.balance -= cost;
+        this.logTrade("ENSEMBLE", pos);
+        this.onPositionOpened?.(pos);
+        placedAny = true;
+        fired++;
+        this.log(
+          `🔬 ENSEMBLE ${market.city} ${market.date} ${market.type} rank-${i + 1}: ${this.bracketLabel(pick.bracket)} @ $${entryPrice.toFixed(2)} ` +
+          `(prob ${(pick.probability * 100).toFixed(0)}%, ${filledShares}sh, $${cost.toFixed(2)}, ${hoursToClose.toFixed(1)}h to close, ens=${memberMean.toFixed(0)}°F)`,
+          "green",
+        );
+      }
+
+      if (placedAny) {
+        // Mark city+date+type as fired so we don't re-evaluate next scan
+        this.ensembleFiredKeys.add(key);
+        this.activeLadderKeys.add(`${market.city.toLowerCase()}-${market.date}-${market.type}`);
+      }
     }
 
     if (fired === 0) {

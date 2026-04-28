@@ -57,6 +57,20 @@ const HIGH_CONF_EDGE = argVal("--high-conf-edge", 0.30);
 const ENTRY_HOURS = argVal("--entry-hours", 24);
 const WINDOW_HOURS = argVal("--window-hours", 12);
 const SCAN_INTERVAL_MIN = argVal("--scan-interval", 5);
+// Ladder mode (off by default): set --ladder-top-n ≥ 2 to bet across the
+// top-N highest-prob brackets per event. Backtest evidence shows +13-17pp
+// ROI lift at top-3 with prob-weighted sizing.
+const LADDER_TOP_N = argVal("--ladder-top-n", 1, parseInt);
+const LADDER_MIN_PROB = argVal("--ladder-min-prob", 0.20);
+const LADDER_SIZING = argValStr("--ladder-sizing", "weighted") as "even" | "front-loaded" | "weighted";
+// KXLOW expansion (off by default): bet on daily-LOW markets in addition
+// to KXHIGH. Doubles candidate event count without new strategy work.
+const INCLUDE_LOWS = hasFlag("--include-lows");
+
+function argValStr(flag: string, fallback: string): string {
+  const idx = args.indexOf(flag);
+  return idx >= 0 ? String(args[idx + 1]) : fallback;
+}
 
 // ─── Isolated state for this instance ────────────────────────────────
 const STATE_PATH = "state/weather-ensemble-sim.json";
@@ -131,6 +145,8 @@ ${c.magenta}${c.bold}  ╔══════════════════
   ${c.dim}Min ensemble prob:${c.reset} ${(MIN_PROB * 100).toFixed(0)}%
   ${c.dim}Entry price band:${c.reset}  $${MIN_PRICE.toFixed(2)} – $${MAX_PRICE.toFixed(2)}
   ${c.dim}Entry window:${c.reset}      ${ENTRY_HOURS}h ± ${WINDOW_HOURS}h before close
+  ${c.dim}Ladder mode:${c.reset}       ${LADDER_TOP_N === 1 ? `${c.dim}OFF${c.reset} (single-bracket)` : `${c.bold}top-${LADDER_TOP_N} ${LADDER_SIZING}${c.reset} ${c.dim}(min prob ${(LADDER_MIN_PROB*100).toFixed(0)}% for non-top picks)${c.reset}`}
+  ${c.dim}KXLOW markets:${c.reset}     ${INCLUDE_LOWS ? `${c.bold}ON${c.reset} ${c.dim}(KXHIGH + KXLOW)${c.reset}` : `${c.dim}OFF${c.reset} (KXHIGH only)`}
   ${c.dim}Scan interval:${c.reset}     ${SCAN_INTERVAL_MIN} min
   ${c.dim}State file:${c.reset}        ${STATE_PATH}
   ${c.dim}Trades CSV:${c.reset}        ${TRADES_CSV}
@@ -188,8 +204,9 @@ async function main() {
 
   if (FRESH) WeatherSimulator.clearSavedState(STATE_PATH);
 
+  // Pass through `includeLows` so the finder also queries KXLOW series when enabled.
   const kalshiFinder = (opts?: { city?: string; daysAhead?: number }) =>
-    findKalshiWeatherMarkets({ ...opts, demo: USE_DEMO });
+    findKalshiWeatherMarkets({ ...opts, demo: USE_DEMO, includeLows: INCLUDE_LOWS });
 
   const sim = new WeatherSimulator({
     startingBalance: MAX_DEPLOYED_USD,
@@ -219,6 +236,10 @@ async function main() {
     ensembleBetSize: BET_SIZE,
     ensembleHighConfMult: HIGH_CONF_MULT,
     ensembleHighConfEdge: HIGH_CONF_EDGE,
+    ensembleLadderTopN: LADDER_TOP_N,
+    ensembleLadderMinProb: LADDER_MIN_PROB,
+    ensembleLadderSizing: LADDER_SIZING,
+    ensembleIncludeLows: INCLUDE_LOWS,
     snipeEnabled: false,
     snipeMaxPrice: 0.92, snipeBudget: 5, snipeMinConfidence: "likely_final",
     // Isolated paths
