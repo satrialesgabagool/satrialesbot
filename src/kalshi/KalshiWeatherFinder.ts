@@ -54,6 +54,33 @@ export const KALSHI_WEATHER_CITIES: KalshiWeatherCity[] = [
   { seriesTicker: "KXHIGHSF",  city: "San Francisco", lat: 37.6188, lon: -122.3754, nwsWfo: "mtr" }, // SFO (KSFO)
   { seriesTicker: "KXHIGHSA",  city: "San Antonio",   lat: 29.5340, lon: -98.4691, nwsWfo: "ewx" },  // SAT (KSAT)
   { seriesTicker: "KXHIGHDC",  city: "Washington DC", lat: 38.8514, lon: -77.0377, nwsWfo: "lwx" },  // Reagan (KDCA)
+  // ─── KXHIGHT* (newer naming) ──────────────────────────────────
+  // Kalshi has rolled out a parallel KXHIGHT* series for daily highs that
+  // uses different city codes for some cities. We track BOTH so the bot
+  // doesn't miss events that have migrated to the new naming. Active vs
+  // dormant varies per-city and per-week — empty series contribute zero
+  // candidates so listing all 14 known KXHIGHT tickers is harmless.
+  { seriesTicker: "KXHIGHTNYC",  city: "New York City", lat: 40.7790, lon: -73.9692, nwsWfo: "okx" },
+  { seriesTicker: "KXHIGHTCHI",  city: "Chicago",       lat: 41.7860, lon: -87.7524, nwsWfo: "lot" },
+  { seriesTicker: "KXHIGHTMIA",  city: "Miami",         lat: 25.7933, lon: -80.2906, nwsWfo: "mfl" },
+  { seriesTicker: "KXHIGHTLAX",  city: "Los Angeles",   lat: 33.9425, lon: -118.4081, nwsWfo: "lox" },
+  { seriesTicker: "KXHIGHTAUS",  city: "Austin",        lat: 30.1945, lon: -97.6699, nwsWfo: "ewx" },
+  { seriesTicker: "KXHIGHTDEN",  city: "Denver",        lat: 39.8617, lon: -104.6732, nwsWfo: "bou" },
+  { seriesTicker: "KXHIGHTATL",  city: "Atlanta",       lat: 33.6367, lon: -84.4281, nwsWfo: "ffc" },
+  { seriesTicker: "KXHIGHTDAL",  city: "Dallas",        lat: 32.8968, lon: -97.0380, nwsWfo: "fwd" },  // ← active right now (Boston/Dallas/etc migrated here)
+  { seriesTicker: "KXHIGHTSEA",  city: "Seattle",       lat: 47.4490, lon: -122.3093, nwsWfo: "sew" },
+  { seriesTicker: "KXHIGHTHOU",  city: "Houston",       lat: 29.6454, lon: -95.2789, nwsWfo: "hgx" },  // ← active (KXHIGHHOU is stale)
+  { seriesTicker: "KXHIGHTPHX",  city: "Phoenix",       lat: 33.4343, lon: -112.0117, nwsWfo: "psr" },
+  { seriesTicker: "KXHIGHTBOS",  city: "Boston",        lat: 42.3631, lon: -71.0064, nwsWfo: "box" },  // ← active right now
+  { seriesTicker: "KXHIGHTLV",   city: "Las Vegas",     lat: 36.0803, lon: -115.1524, nwsWfo: "vef" },
+  { seriesTicker: "KXHIGHTMIN",  city: "Minneapolis",   lat: 44.8820, lon: -93.2218, nwsWfo: "mpx" },  // ← active
+  { seriesTicker: "KXHIGHTPHIL", city: "Philadelphia",  lat: 39.8721, lon: -75.2407, nwsWfo: "phi" },
+  { seriesTicker: "KXHIGHTSFO",  city: "San Francisco", lat: 37.6188, lon: -122.3754, nwsWfo: "mtr" },  // ← active
+  { seriesTicker: "KXHIGHTSATX", city: "San Antonio",   lat: 29.5340, lon: -98.4691, nwsWfo: "ewx" },
+  { seriesTicker: "KXHIGHTDC",   city: "Washington DC", lat: 38.8514, lon: -77.0377, nwsWfo: "lwx" },  // ← active
+  // KXHIGHT-only cities (no parallel KXHIGH)
+  { seriesTicker: "KXHIGHTOKC",  city: "Oklahoma City", lat: 35.3931, lon: -97.6007, nwsWfo: "oun" },
+  { seriesTicker: "KXHIGHTNOLA", city: "New Orleans",   lat: 29.9934, lon: -90.2580, nwsWfo: "lix" },
 ];
 
 /**
