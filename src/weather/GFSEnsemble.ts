@@ -51,6 +51,9 @@ const CITY_COORDS: Record<string, { lat: number; lon: number }> = {
   "san francisco": { lat: 37.6188, lon: -122.3754 },  // SFO (KSFO)
   "san antonio":   { lat: 29.5340, lon: -98.4691 },   // SAT (KSAT)
   "washington dc": { lat: 38.8514, lon: -77.0377 },   // Reagan (KDCA)
+  // Cities only available on KXLOW
+  "oklahoma city": { lat: 35.3931, lon: -97.6007 },   // Will Rogers (KOKC)
+  "new orleans":   { lat: 29.9934, lon: -90.2580 },   // Louis Armstrong (KMSY)
   // Kalshi abbreviations
   "nyc": { lat: 40.7790, lon: -73.9692 },
   "ny":  { lat: 40.7790, lon: -73.9692 },
@@ -75,7 +78,10 @@ const CITY_COORDS: Record<string, { lat: number; lon: number }> = {
   "sf":  { lat: 37.6188, lon: -122.3754 },
   "sfo": { lat: 37.6188, lon: -122.3754 },
   "sa":  { lat: 29.5340, lon: -98.4691 },
+  "satx": { lat: 29.5340, lon: -98.4691 },
   "dc":  { lat: 38.8514, lon: -77.0377 },
+  "okc": { lat: 35.3931, lon: -97.6007 },
+  "nola": { lat: 29.9934, lon: -90.2580 },
 };
 
 export interface GFSDayMembers {

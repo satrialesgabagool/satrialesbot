@@ -41,6 +41,9 @@ const CITY_COORDS: Record<string, { lat: number; lon: number; country: "US" | "I
   "san francisco": { lat: 37.6188, lon: -122.3754, country: "US" }, // SFO (KSFO)
   "san antonio":   { lat: 29.5340, lon: -98.4691, country: "US" },  // SAT (KSAT)
   "washington dc": { lat: 38.8514, lon: -77.0377, country: "US" },  // Reagan (KDCA)
+  // Cities only available on KXLOW (no parallel KXHIGH series)
+  "oklahoma city": { lat: 35.3931, lon: -97.6007, country: "US" },  // Will Rogers (KOKC)
+  "new orleans":   { lat: 29.9934, lon: -90.2580, country: "US" },  // Louis Armstrong (KMSY)
   // International cities (Polymarket)
   "london": { lat: 51.5074, lon: -0.1278, country: "INT" },
   "paris": { lat: 48.8566, lon: 2.3522, country: "INT" },

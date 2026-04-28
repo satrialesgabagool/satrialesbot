@@ -57,13 +57,43 @@ export const KALSHI_WEATHER_CITIES: KalshiWeatherCity[] = [
 ];
 
 /**
- * Daily-LOW temperature series — same cities as the highs.
- * Generated programmatically to keep the two lists in sync.
+ * Daily-LOW temperature series — Kalshi uses a different naming pattern
+ * than KXHIGH. The series prefix is `KXLOWT` (note the T) and several
+ * city codes differ from their KXHIGH equivalents:
+ *   KXHIGHNY  → KXLOWTNYC   (NY → NYC)
+ *   KXHIGHLAS → KXLOWTLV    (LAS → LV)
+ *   KXHIGHSF  → KXLOWTSFO   (SF → SFO)
+ *   KXHIGHSA  → KXLOWTSATX  (SA → SATX)
+ *   KXHIGHPHI → KXLOWTPHIL  (PHI → PHIL)
+ * Other cities use the same code with the KXLOWT prefix.
+ *
+ * Note: Kalshi posts KXLOW events less consistently than KXHIGH (some
+ * cities have 0 active events at any given time). The finder gracefully
+ * handles empty series — they just contribute no candidate markets.
  */
-export const KALSHI_WEATHER_LOW_CITIES: KalshiWeatherCity[] = KALSHI_WEATHER_CITIES.map(c => ({
-  ...c,
-  seriesTicker: c.seriesTicker.replace(/^KXHIGH/, "KXLOW"),
-}));
+export const KALSHI_WEATHER_LOW_CITIES: KalshiWeatherCity[] = [
+  { seriesTicker: "KXLOWTNYC",  city: "New York City", lat: 40.7790, lon: -73.9692, nwsWfo: "okx" },
+  { seriesTicker: "KXLOWTCHI",  city: "Chicago",       lat: 41.7860, lon: -87.7524, nwsWfo: "lot" },
+  { seriesTicker: "KXLOWTMIA",  city: "Miami",         lat: 25.7933, lon: -80.2906, nwsWfo: "mfl" },
+  { seriesTicker: "KXLOWTLAX",  city: "Los Angeles",   lat: 33.9425, lon: -118.4081, nwsWfo: "lox" },
+  { seriesTicker: "KXLOWTAUS",  city: "Austin",        lat: 30.1945, lon: -97.6699, nwsWfo: "ewx" },
+  { seriesTicker: "KXLOWTDEN",  city: "Denver",        lat: 39.8617, lon: -104.6732, nwsWfo: "bou" },
+  { seriesTicker: "KXLOWTATL",  city: "Atlanta",       lat: 33.6367, lon: -84.4281, nwsWfo: "ffc" },
+  { seriesTicker: "KXLOWTDAL",  city: "Dallas",        lat: 32.8968, lon: -97.0380, nwsWfo: "fwd" },
+  { seriesTicker: "KXLOWTSEA",  city: "Seattle",       lat: 47.4490, lon: -122.3093, nwsWfo: "sew" },
+  { seriesTicker: "KXLOWTHOU",  city: "Houston",       lat: 29.6454, lon: -95.2789, nwsWfo: "hgx" },
+  { seriesTicker: "KXLOWTPHX",  city: "Phoenix",       lat: 33.4343, lon: -112.0117, nwsWfo: "psr" },
+  { seriesTicker: "KXLOWTBOS",  city: "Boston",        lat: 42.3631, lon: -71.0064, nwsWfo: "box" },
+  { seriesTicker: "KXLOWTLV",   city: "Las Vegas",     lat: 36.0803, lon: -115.1524, nwsWfo: "vef" },
+  { seriesTicker: "KXLOWTMIN",  city: "Minneapolis",   lat: 44.8820, lon: -93.2218, nwsWfo: "mpx" },
+  { seriesTicker: "KXLOWTPHIL", city: "Philadelphia",  lat: 39.8721, lon: -75.2407, nwsWfo: "phi" },
+  { seriesTicker: "KXLOWTSFO",  city: "San Francisco", lat: 37.6188, lon: -122.3754, nwsWfo: "mtr" },
+  { seriesTicker: "KXLOWTSATX", city: "San Antonio",   lat: 29.5340, lon: -98.4691, nwsWfo: "ewx" },
+  { seriesTicker: "KXLOWTDC",   city: "Washington DC", lat: 38.8514, lon: -77.0377, nwsWfo: "lwx" },
+  // Cities only available on the LOW series (no parallel KXHIGH)
+  { seriesTicker: "KXLOWTOKC",  city: "Oklahoma City", lat: 35.3931, lon: -97.6007, nwsWfo: "oun" },
+  { seriesTicker: "KXLOWTNOLA", city: "New Orleans",   lat: 29.9934, lon: -90.2580, nwsWfo: "lix" },
+];
 
 // Singleton client for market data (no auth needed)
 let _client: KalshiClient | null = null;
