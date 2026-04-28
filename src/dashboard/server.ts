@@ -143,6 +143,65 @@ function hoursToClose(iso: string | undefined): number {
   return Math.max(0, (new Date(iso).getTime() - Date.now()) / 3600000);
 }
 
+// ─── Helpers for forecast-aware position enrichment ───────────────────
+
+/** Parse "KXHIGHNY-26APR23" → { citySeries: "NY", dateIso: "2026-04-23" }. */
+function parseEventTicker(eventTicker: string | null): { citySeries: string; dateIso: string } | null {
+  if (!eventTicker) return null;
+  const m = eventTicker.match(/^KXHIGH([A-Z]+)-(\d{2})([A-Z]{3})(\d{2})$/);
+  if (!m) return null;
+  const [, city, yy, monAbbr, dd] = m;
+  const MONTHS: Record<string, string> = {
+    JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12",
+  };
+  const mm = MONTHS[monAbbr];
+  if (!mm) return null;
+  return { citySeries: city, dateIso: `20${yy}-${mm}-${dd}` };
+}
+
+/** Extract bracket temperature range from Kalshi market strike info. */
+function bracketFromKalshiMarket(m: any): { lowF: number; highF: number } | null {
+  if (!m) return null;
+  const floor = typeof m.floor_strike === "number" ? m.floor_strike : null;
+  const cap = typeof m.cap_strike === "number" ? m.cap_strike : null;
+  const type = m.strike_type;
+  if (type === "less" || type === "less_or_equal") {
+    if (cap == null) return null;
+    return { lowF: -Infinity, highF: cap };
+  }
+  if (type === "greater" || type === "greater_or_equal") {
+    if (floor == null) return null;
+    return { lowF: floor, highF: Infinity };
+  }
+  if (type === "between" || type === "structured" || type === "custom") {
+    if (floor == null || cap == null) return null;
+    return { lowF: floor, highF: cap };
+  }
+  // Fallback: if we have both strikes, assume interval
+  if (floor != null && cap != null) return { lowF: floor, highF: cap };
+  if (cap != null) return { lowF: -Infinity, highF: cap };
+  if (floor != null) return { lowF: floor, highF: Infinity };
+  return null;
+}
+
+/**
+ * Expected value per share, net of Kalshi's 7% fee on winnings.
+ *
+ *   If position wins (prob = modelProb), payoff = $1 gross.
+ *   Winnings = $1 - entry. Fee = 0.07 × winnings.
+ *   Net receipt on win = $1 - 0.07 × (1 - entry) = 0.93 + 0.07 × entry
+ *   Gain on win = 0.93 + 0.07 × entry - entry = 0.93 × (1 - entry)
+ *
+ *   If position loses (prob = 1 - modelProb), gain = -entry.
+ *
+ *   EV_per_share = modelProb × 0.93 × (1 - entry) - (1 - modelProb) × entry
+ */
+const KALSHI_WINNINGS_FEE = 0.07;
+function expectedValuePerShare(modelProb: number, entryPrice: number): number {
+  const p = Math.max(0, Math.min(1, modelProb));
+  return p * (1 - KALSHI_WINNINGS_FEE) * (1 - entryPrice) - (1 - p) * entryPrice;
+}
+
 // ─── Trade CSV parser ─────────────────────────────────────────────────
 
 interface TradeRow {
@@ -220,6 +279,34 @@ function botInfo(key: BotKey) {
   const openPositions: any[] = state?.positions ?? [];
   const closedPositions: any[] = state?.closedPositions ?? [];
 
+  // Compute "today's P&L" from resolved closures since local midnight.
+  // The daily tracker file only records orders placed, not P&L from
+  // resolutions — so we derive it here from post-audit closedPositions
+  // for a trustworthy number that updates the moment a position settles.
+  const todayStartIso = new Date(new Date().toDateString()).toISOString();
+  const closedToday = closedPositions.filter(p => (p.resolvedAt || "") >= todayStartIso);
+  const todayPnl = closedToday.reduce((s, p) => s + (Number(p.pnl) || 0), 0);
+
+  // Per-bot performance metrics — derived from post-audit closedPositions
+  const wins = closedPositions.filter(p => (Number(p.pnl) || 0) > 0);
+  const losses = closedPositions.filter(p => (Number(p.pnl) || 0) < 0);
+  const winRate = closedPositions.length > 0 ? wins.length / closedPositions.length : null;
+  const avgWinUSD = wins.length > 0 ? wins.reduce((s, p) => s + p.pnl, 0) / wins.length : 0;
+  const avgLossUSD = losses.length > 0 ? losses.reduce((s, p) => s + p.pnl, 0) / losses.length : 0;
+  const winLossRatio = avgLossUSD < 0 ? Math.abs(avgWinUSD / avgLossUSD) : null;
+  const startingBalance = state?.config?.startingBalance ?? 0;
+  const realizedPnl = state?.totalPnl ?? 0;
+  const roiPct = startingBalance > 0 ? (realizedPnl / startingBalance) * 100 : null;
+  // Trades per day: number of closures over days-since-launch
+  const earliestClosure = closedPositions
+    .map(p => p.resolvedAt || p.entryTime)
+    .filter((t): t is string => !!t)
+    .sort()[0];
+  const daysSinceLaunch = earliestClosure
+    ? Math.max(0.5, (Date.now() - new Date(earliestClosure).getTime()) / 86400_000)
+    : 1;
+  const tradesPerDay = closedPositions.length / daysSinceLaunch;
+
   return {
     name: cfg.name,
     displayName: cfg.displayName,
@@ -242,25 +329,39 @@ function botInfo(key: BotKey) {
           ensembleBetSize: state.config?.ensembleBetSize ?? null,
         }
       : null,
-    daily: tracker
-      ? {
-          date: tracker.date ?? null,
-          dailyPnl: tracker.dailyPnl ?? null,
-          firstOrderConfirmed: tracker.firstOrderConfirmed ?? null,
-          orderCount: tracker.orderCount ?? null,
-        }
-      : null,
+    daily: {
+      // dailyPnl is now computed from post-audit closedPositions resolved today,
+      // not from the tracker's never-updated realizedPnL field.
+      date: tracker?.date ?? new Date().toISOString().slice(0, 10),
+      dailyPnl: +todayPnl.toFixed(2),
+      closedToday: closedToday.length,
+      firstOrderConfirmed: tracker?.firstOrderConfirmed ?? null,
+      ordersPlaced: tracker?.ordersPlaced ?? null,
+      ordersFilled: tracker?.ordersFilled ?? null,
+    },
     totals: state
       ? {
           balance: state.balance ?? 0,
           deployed: state.deployed ?? 0,
           openCount: openPositions.length,
           closedCount: closedPositions.length,
-          wins: state.wins ?? 0,
-          losses: state.losses ?? 0,
+          wins: wins.length,
+          losses: losses.length,
           totalPnl: state.totalPnl ?? 0,
           scansCompleted: state.scansCompleted ?? 0,
           savedAt: state.savedAt ?? null,
+        }
+      : null,
+    // Per-bot performance metrics — derived from post-audit closedPositions
+    performance: state
+      ? {
+          winRate,                             // 0..1 (or null if no trades yet)
+          avgWinUSD: +avgWinUSD.toFixed(2),
+          avgLossUSD: +avgLossUSD.toFixed(2),
+          winLossRatio: winLossRatio != null ? +winLossRatio.toFixed(2) : null,
+          roiPct: roiPct != null ? +roiPct.toFixed(2) : null,
+          tradesPerDay: +tradesPerDay.toFixed(1),
+          daysSinceLaunch: +daysSinceLaunch.toFixed(1),
         }
       : null,
   };
@@ -378,6 +479,23 @@ app.get("/api/positions", async (c) => {
       // Build the per-bot managed-ticker sets once (avoids re-reading state files N times)
       const managed = buildManagedTickerSets();
 
+      // Pre-fetch ensemble forecasts for every unique city with a position.
+      // One API call per city gives us up to 7 days of members; we match by date.
+      const uniqueCities = Array.from(new Set(
+        open.map(p => {
+          const parsed = parseEventTicker(marketByTicker.get(p.ticker)?.event_ticker ?? null);
+          return parsed?.citySeries;
+        }).filter((x): x is string => !!x)
+      ));
+      const ensembleByCity: Record<string, any> = {};
+      await Promise.all(uniqueCities.map(async city => {
+        try {
+          ensembleByCity[city] = await cached(`ensemble:${city}:7d`, 10 * 60_000, () => fetchGFSEnsemble(city, 7));
+        } catch {
+          ensembleByCity[city] = null;
+        }
+      }));
+
       const positions = open.map(p => {
         const posShares = parseFloat(p.position_fp);
         const side: "yes" | "no" = posShares >= 0 ? "yes" : "no";
@@ -401,6 +519,58 @@ app.get("/api/positions", async (c) => {
 
         const { bot, orphanHint } = classifyPosition(p.ticker, avgEntryPrice, managed);
 
+        // Settlement classification — detects "effectively decided" positions
+        // where the market has converged so close to $0 or $1 that the outcome
+        // is essentially locked in but Kalshi hasn't paid out yet.
+        // For YES positions: mark ≥ $0.95 → pending-win, mark ≤ $0.05 → pending-loss.
+        // For NO positions: opposite.
+        // Pending-win expected payout uses the same fee-aware formula as the
+        // EV calculator: net = shares × (0.93 + 0.07 × entry).
+        let settlementStatus: "pending-win" | "pending-loss" | "active" = "active";
+        let pendingPayoutUSD = 0;
+        if (markPrice >= 0.95) {
+          settlementStatus = side === "yes" ? "pending-win" : "pending-loss";
+        } else if (markPrice <= 0.05) {
+          settlementStatus = side === "yes" ? "pending-loss" : "pending-win";
+        }
+        if (settlementStatus === "pending-win") {
+          // Net cash you'll receive after Kalshi's 7% winnings fee
+          pendingPayoutUSD = +(shares * (0.93 + 0.07 * avgEntryPrice)).toFixed(2);
+        }
+
+        // Forecast enrichment: match this position's date against the ensemble
+        // for its city, compute our bracket probability + expected value.
+        const parsedTicker = parseEventTicker(m?.event_ticker ?? null);
+        const ensemble = parsedTicker ? ensembleByCity[parsedTicker.citySeries] : null;
+        const day = ensemble?.days?.find((d: any) => d.date === parsedTicker?.dateIso) ?? null;
+        const members: number[] = day?.highF_members ?? [];
+        const bracketRange = bracketFromKalshiMarket(m);
+
+        let modelProb: number | null = null;
+        let forecastStats: { mean: number; stddev: number; p10: number; median: number; p90: number } | null = null;
+        let expectedValueUSD: number | null = null;
+        let expectedValuePerShareUSD: number | null = null;
+
+        if (members.length >= 10) {
+          const sorted = [...members].sort((a, b) => a - b);
+          const mean = members.reduce((a, b) => a + b, 0) / members.length;
+          const variance = members.reduce((a, b) => a + (b - mean) ** 2, 0) / members.length;
+          forecastStats = {
+            mean,
+            stddev: Math.sqrt(variance),
+            p10: sorted[Math.floor(sorted.length * 0.1)],
+            median: sorted[Math.floor(sorted.length * 0.5)],
+            p90: sorted[Math.floor(sorted.length * 0.9)],
+          };
+          if (bracketRange) {
+            modelProb = empiricalBracketProbability(members, bracketRange.lowF, bracketRange.highF);
+            // Side-adjust: if we're short YES (i.e. holding NO), our payoff probability is 1 - modelProb.
+            const winProb = side === "yes" ? modelProb : 1 - modelProb;
+            expectedValuePerShareUSD = expectedValuePerShare(winProb, avgEntryPrice);
+            expectedValueUSD = +(shares * expectedValuePerShareUSD).toFixed(4);
+          }
+        }
+
         return {
           ticker: p.ticker,
           eventTicker: m?.event_ticker ?? null,
@@ -408,6 +578,7 @@ app.get("/api/positions", async (c) => {
           orphanHint: orphanHint ?? null,
           city,
           bracketText,
+          bracketRange,
           side,
           shares,
           avgEntryPrice,
@@ -421,9 +592,31 @@ app.get("/api/positions", async (c) => {
           hoursToClose: hoursToClose(m?.close_time),
           status: m?.status ?? "unknown",
           restingOrdersCount: p.resting_orders_count ?? 0,
+          // Forecast-aware fields (null if we couldn't pull an ensemble for this market)
+          modelProb,
+          expectedValuePerShareUSD,
+          expectedValueUSD,
+          forecast: forecastStats,
+          // Settlement awareness — surfaces "effectively decided" positions
+          settlementStatus,
+          pendingPayoutUSD,
         };
       });
 
+      // Filter Model EV to FAR-FROM-CLOSE positions only. Within ~12h of
+      // close the market has typically incorporated observed temperatures
+      // that the ensemble forecast hasn't seen, making model probabilities
+      // stale. Showing model EV for those positions led to wildly inflated
+      // numbers that confused more than they helped.
+      const MIN_HOURS_FOR_MODEL_EV = 12;
+      const withEV = positions.filter(p =>
+        p.expectedValueUSD != null && (p.hoursToClose ?? 0) >= MIN_HOURS_FOR_MODEL_EV
+      );
+      const stalePositions = positions.filter(p =>
+        p.expectedValueUSD != null && (p.hoursToClose ?? 0) < MIN_HOURS_FOR_MODEL_EV
+      );
+      const pendingWins = positions.filter(p => p.settlementStatus === "pending-win");
+      const pendingLosses = positions.filter(p => p.settlementStatus === "pending-loss");
       const summary = {
         managed: positions.filter(p => p.bot === "intrinsic" || p.bot === "ensemble").length,
         intrinsic: positions.filter(p => p.bot === "intrinsic").length,
@@ -432,6 +625,23 @@ app.get("/api/positions", async (c) => {
         external: positions.filter(p => p.bot === "external").length,
         orphanExposureUSD: +positions.filter(p => p.bot === "orphan").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
         externalExposureUSD: +positions.filter(p => p.bot === "external").reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
+        // Expected P&L across positions with forecast coverage AND
+        // far enough from close that the model is still informative.
+        totalExpectedValueUSD: +withEV.reduce((s, p) => s + (p.expectedValueUSD ?? 0), 0).toFixed(2),
+        positionsWithForecast: withEV.length,
+        // Capital-weighted average model win-prob across actionable positions
+        avgModelProb: withEV.length
+          ? +(withEV.reduce((s, p) => s + (p.modelProb ?? 0) * p.exposureUSD, 0) /
+             Math.max(0.01, withEV.reduce((s, p) => s + p.exposureUSD, 0))).toFixed(4)
+          : null,
+        // How many positions were excluded because model is stale
+        stalePositionsCount: stalePositions.length,
+        // Pending-settlement totals — positions effectively decided but
+        // not yet paid out by Kalshi
+        pendingWinsCount: pendingWins.length,
+        pendingLossesCount: pendingLosses.length,
+        pendingPayoutUSD: +pendingWins.reduce((s, p) => s + (p.pendingPayoutUSD ?? 0), 0).toFixed(2),
+        pendingLossExposureUSD: +pendingLosses.reduce((s, p) => s + p.exposureUSD, 0).toFixed(2),
       };
 
       return { configured: true, positions, summary };
@@ -619,30 +829,37 @@ app.get("/api/trades", (c) => {
 });
 
 // ─── Equity curve ─────────────────────────────────────────────────────
-// Returns THREE series so the UI can toggle what it shows:
-//   1. kalshi        — ground-truth account value over time (logged by this
-//                      server every ~10 min while running)
-//   2. intrinsicPnl  — cumulative realized P&L from the intrinsic bot's CSV
-//   3. ensemblePnl   — cumulative realized P&L from the ensemble bot's CSV
-//   4. combinedPnl   — combined cumulative P&L across both bots (merged by time)
+// Returns several series so the UI can toggle what it shows:
+//   kalshi       — ground-truth Kalshi balance snapshots logged by this
+//                  server every ~10 min while running
+//   intrinsicPnl — cumulative realized P&L from the intrinsic bot
+//   ensemblePnl  — cumulative realized P&L from the ensemble bot
+//   combinedPnl  — both bots summed over time (merged by resolvedAt)
 //
-// Cumulative P&L is computed by summing the `pnl` column row-by-row. Since
-// pnl is a per-trade realized figure (independent of the simulator's
-// internal balance), this stitches cleanly across --fresh restarts.
+// Cumulative P&L is derived from the bot state's `closedPositions[]`, which
+// is the POST-AUDIT source of truth. (Earlier versions read the CSV
+// directly, but when the simulator's startup audit corrects classifications
+// against Kalshi's actual settlement results, it only updates the state file
+// — the historical CSV rows keep their original (pre-audit) values. Reading
+// state.closedPositions guarantees the chart always reflects corrected P&L.)
 
-function cumulativePnlFromCsv(path: string, bot: BotKey): Array<{ t: string; value: number }> {
-  const rows = parseCsv(path, bot);
-  rows.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+function cumulativePnlFromState(statePath: string): Array<{ t: string; value: number }> {
+  const s = readJson(statePath);
+  const closed: any[] = s?.closedPositions ?? [];
+  const sorted = closed
+    .map(p => ({ t: p.resolvedAt || p.entryTime || null, pnl: Number(p.pnl) || 0 }))
+    .filter(p => p.t != null)
+    .sort((a, b) => a.t!.localeCompare(b.t!));
   let acc = 0;
-  return rows.map(r => {
+  return sorted.map(r => {
     acc += r.pnl;
-    return { t: r.timestamp, value: +acc.toFixed(4) };
+    return { t: r.t as string, value: +acc.toFixed(4) };
   });
 }
 
 app.get("/api/equity", (c) => {
-  const intrinsicPnl = cumulativePnlFromCsv(BOTS.intrinsic.tradesPath, "intrinsic");
-  const ensemblePnl = cumulativePnlFromCsv(BOTS.ensemble.tradesPath, "ensemble");
+  const intrinsicPnl = cumulativePnlFromState(BOTS.intrinsic.statePath);
+  const ensemblePnl = cumulativePnlFromState(BOTS.ensemble.statePath);
 
   // Combined: merge both bots by timestamp, carry forward each bot's running total
   const allEvents = [

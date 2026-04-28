@@ -205,12 +205,16 @@ async function main() {
     exchange: "kalshi",
     mode: "live",
 
-    // INTRINSIC-WINNER STRATEGY — validated by 14d tape backtest (94% WR, +5.6% ROI)
+    // INTRINSIC-WINNER STRATEGY — validated by 14d tape backtest (94% WR, +5.6% ROI).
+    // Live data revised the upper bound on 2026-04-26 after 12 closed trades
+    // showed the $0.85-$0.92 zone lost -$36 across 6 trades (W/L ratio 0.07×).
+    // At $0.90 entry the win pays ~$0.07 net but the loss costs $0.90, requiring
+    // ~91% WR to break even versus ~58% achieved. Lowering ceiling to $0.85.
     strategy: "intrinsic",
     intrinsicHoursBefore: 8,
     intrinsicWindowHours: 4,
     intrinsicMinPrice: 0.70,
-    intrinsicMaxPrice: 0.95,
+    intrinsicMaxPrice: 0.85,
     intrinsicMinGap: 0.05,
     intrinsicBetSize: MAX_PER_ORDER_USD,
 

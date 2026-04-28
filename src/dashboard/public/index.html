@@ -88,6 +88,10 @@ td.num { text-align: right; }
 .tag-ensemble  { background: rgba(155,89,182,0.15); color: #c098d6; border: 1px solid rgba(155,89,182,0.3); }
 .tag-orphan    { background: rgba(243,156,18,0.15); color: #f5b867; border: 1px solid rgba(243,156,18,0.3); }
 .tag-external  { background: rgba(93,100,120,0.18); color: #a7aec2; border: 1px solid rgba(93,100,120,0.35); }
+.tag-pending-win   { background: rgba(46,204,113,0.18); color: #7dd9a4; border: 1px solid rgba(46,204,113,0.35); }
+.tag-pending-loss  { background: rgba(231,76,60,0.15); color: #f0a095; border: 1px solid rgba(231,76,60,0.3); }
+tr.pending-win  td { background: rgba(46,204,113,0.04); }
+tr.pending-loss td { background: rgba(231,76,60,0.03); }
 .tag-unknown   { background: var(--bg-elev); color: var(--text-dim); }
 .hint { display: inline-block; margin-left: 6px; font-size: 10px; color: var(--text-mute); font-style: italic; }
 .summary-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 11px; color: var(--text-dim); margin-bottom: 10px; padding: 8px 10px; background: var(--bg-elev); border-radius: 5px; }
@@ -192,8 +196,10 @@ td.num { text-align: right; }
       <label>Sort
         <select id="pos-sort">
           <option value="closes">Closes soonest</option>
-          <option value="pnl-desc">P&amp;L ↓</option>
-          <option value="pnl-asc">P&amp;L ↑</option>
+          <option value="ev-desc">Expected P&amp;L ↓</option>
+          <option value="ev-asc">Expected P&amp;L ↑</option>
+          <option value="pnl-desc">Unreal. P&amp;L ↓</option>
+          <option value="pnl-asc">Unreal. P&amp;L ↑</option>
           <option value="exposure">Exposure</option>
         </select>
       </label>
@@ -201,6 +207,15 @@ td.num { text-align: right; }
   </header>
   <div id="positions-summary"></div>
   <div id="positions-body"></div>
+</section>
+
+<!-- Forecast coverage on open positions -->
+<section>
+  <header>
+    <h2>Forecast coverage on open positions <span class="count" id="coverage-count">—</span></h2>
+    <span class="dim" style="font-size:11px">Current 82-member GFS+ECMWF ensemble re-run every refresh</span>
+  </header>
+  <div id="coverage-body"></div>
 </section>
 
 <!-- Resting orders -->
@@ -338,104 +353,178 @@ function renderTopCards() {
   const totalLosses = (intrinsicBot?.totals?.losses ?? 0) + (ensembleBot?.totals?.losses ?? 0);
   const wr = (totalWins + totalLosses) > 0 ? totalWins / (totalWins + totalLosses) : null;
 
-  const unrealized = app.positions.reduce((s, p) => s + (p.unrealizedPnlUSD ?? 0), 0);
+  // Two ways to compute "unrealized P&L":
+  //   - Bid-based: sum of (mark × shares − cost) per position. Optimistic
+  //     because bid × shares overstates exit value when bid sizes are thin,
+  //     and counts pending-settlement winners at full $0.99 mark.
+  //   - Kalshi-derived: portfolio_value − cash − cost. Matches Kalshi's own
+  //     marked-to-market accounting, which excludes decided-but-pending
+  //     winners until they actually settle. More conservative, more accurate
+  //     as a snapshot of "what's in your account right now."
+  const unrealizedBid = app.positions.reduce((s, p) => s + (p.unrealizedPnlUSD ?? 0), 0);
+  const unrealizedKalshi = (p?.configured && p?.portfolioValueUSD != null && p?.totalDeployedUSD != null)
+    ? (p.portfolioValueUSD - p.cashUSD - p.totalDeployedUSD)
+    : null;
+  const unrealized = unrealizedKalshi ?? unrealizedBid; // primary (used elsewhere too)
   const todayPnlI = intrinsicBot?.daily?.dailyPnl ?? 0;
   const todayPnlE = ensembleBot?.daily?.dailyPnl ?? 0;
   const todayPnl = todayPnlI + todayPnlE;
+  // Total P&L: realized (audit-corrected) + Kalshi-derived unrealized.
+  // We also expose the post-settlement projection (bid-based) since pending
+  // winners are real money that will land in cash within hours.
+  const totalPnlNow = totalRealized + (unrealizedKalshi ?? unrealizedBid);
+  const totalPnlPostSettle = totalRealized + unrealizedBid;
 
   const cashText = p?.configured ? fmt.money(p.cashUSD) : '—';
   const pvText = p?.configured ? fmt.money(p.portfolioValueUSD) : '—';
 
+  // 5-card focused layout: account state + the metrics that actually matter.
+  // Pending settlement appears as a 6th card only when there's something pending.
+  // The "Expected P&L (model)" metric moved to the per-bot performance cards
+  // since it now only counts far-from-close positions where the model is
+  // actually informative (we used to surface this front-and-center, but the
+  // numbers were wildly inflated for near-close positions where the market
+  // already knows what we don't).
   el.innerHTML = `
-    <div class="card">
-      <div class="label">Cash balance</div>
+    <div class="card" title="Settled cash in your Kalshi account, available to deploy.">
+      <div class="label">Cash</div>
       <div class="value">${cashText}</div>
-      <div class="sub">${p?.configured ? 'Kalshi account' : 'Kalshi not configured'}</div>
+      <div class="sub">${p?.openPositionCount ?? 0} positions · ${fmt.money(p?.totalDeployedUSD ?? 0)} deployed</div>
     </div>
-    <div class="card">
+    <div class="card" title="Kalshi's reported account value: cash + mark of open positions. Conservative — excludes decided-but-not-yet-settled winners.">
       <div class="label">Portfolio value</div>
       <div class="value">${pvText}</div>
-      <div class="sub">cash + open positions (mark)</div>
+      <div class="sub">Kalshi marked-to-market</div>
     </div>
-    <div class="card">
-      <div class="label">Deployed</div>
-      <div class="value">${p?.configured ? fmt.money(p.totalDeployedUSD) : '—'}</div>
-      <div class="sub">${p?.openPositionCount ?? 0} open positions</div>
+    <div class="card" title="Realized P&L from closed trades + unrealized P&L derived from Kalshi's portfolio value. Source of truth for ongoing P&L.">
+      <div class="label">Total P&amp;L</div>
+      <div class="value ${pnlClass(totalPnlNow)}">${fmt.moneyPos(totalPnlNow)}</div>
+      <div class="sub">realized ${fmt.moneyPos(totalRealized)} · post-settle ~<span class="${pnlClass(totalPnlPostSettle)}">${fmt.moneyPos(totalPnlPostSettle)}</span></div>
     </div>
-    <div class="card">
-      <div class="label">Unrealized P&amp;L</div>
-      <div class="value ${pnlClass(unrealized)}">${fmt.moneyPos(unrealized)}</div>
-      <div class="sub">marked at bid</div>
-    </div>
-    <div class="card">
+    <div class="card" title="P&L from positions that resolved since local midnight today. Updates the moment a position settles.">
       <div class="label">Today's P&amp;L</div>
       <div class="value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)}</div>
-      <div class="sub">I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
+      <div class="sub">${(intrinsicBot?.daily?.closedToday ?? 0) + (ensembleBot?.daily?.closedToday ?? 0)} resolved · I ${fmt.moneyPos(todayPnlI)} · E ${fmt.moneyPos(todayPnlE)}</div>
     </div>
-    <div class="card">
-      <div class="label">Session win rate</div>
-      <div class="value">${wr == null ? '—' : fmt.pct0(wr)}</div>
-      <div class="sub">${totalWins}W · ${totalLosses}L · realized ${fmt.moneyPos(totalRealized)}</div>
-    </div>
+    ${(() => {
+      const s = app.positionsSummary;
+      const wins = s?.pendingWinsCount ?? 0;
+      const losses = s?.pendingLossesCount ?? 0;
+      const payout = s?.pendingPayoutUSD ?? 0;
+      const lossExp = s?.pendingLossExposureUSD ?? 0;
+      if (wins === 0 && losses === 0) {
+        return `
+          <div class="card" title="No positions are currently in 'decided but not yet settled' state.">
+            <div class="label">⏳ Pending settlement</div>
+            <div class="value dim">$0.00</div>
+            <div class="sub">0 winners · 0 losers</div>
+          </div>
+        `;
+      }
+      return `
+        <div class="card" style="border-color:rgba(243,156,18,0.45);background:linear-gradient(180deg,rgba(243,156,18,0.05),var(--bg-card))" title="Positions where the YES bid has converged ≥ $0.95 (winners) or ≤ $0.05 (losers) — outcome decided, just waiting for Kalshi to settle and credit cash.">
+          <div class="label">⏳ Pending settlement</div>
+          <div class="value yellow">${fmt.money(payout)}</div>
+          <div class="sub">${wins} win${wins===1?'':'s'} (~${fmt.money(payout)} into cash) · ${losses} loss${losses===1?'es':''} ($${lossExp.toFixed(2)} cost written off)</div>
+        </div>
+      `;
+    })()}
   `;
 }
 
-// ─── Bot chips ────────────────────────────────────────────────────────
+// ─── Per-bot performance cards ───────────────────────────────────────
+// Replaces the old "9-tile bot chip" with a tighter layout that focuses
+// on performance-evaluation metrics: WR, avg win, avg loss, win/loss
+// ratio, ROI%, today's P&L, capital utilization. Also adds the model EV
+// for THIS bot's open positions (filtered to T-12h+ for relevance).
 function renderBotRow() {
   const el = document.getElementById('bot-row');
   const bots = app.bots?.bots ?? [];
+  // Compute bot-specific model EV from open positions (already filtered server-side
+  // to far-from-close to avoid stale-model garbage)
+  const modelEvByBot = { intrinsic: 0, ensemble: 0 };
+  const modelEvCountByBot = { intrinsic: 0, ensemble: 0 };
+  for (const p of (app.positions ?? [])) {
+    if (p.expectedValueUSD == null) continue;
+    if ((p.hoursToClose ?? 0) < 12) continue; // mirror server-side filter
+    if (p.bot === 'intrinsic' || p.bot === 'ensemble') {
+      modelEvByBot[p.bot] += p.expectedValueUSD;
+      modelEvCountByBot[p.bot] += 1;
+    }
+  }
+
   el.innerHTML = bots.map(b => {
     const statusClass = b.running ? 'ok' : 'bad';
     const statusText = b.running ? 'Running' : 'Stopped';
     const killClass = b.killSwitch ? 'bad' : 'ok';
     const killText = b.killSwitch ? 'HALTED' : 'armed';
     const caps = b.caps ?? {};
+    const t = b.totals ?? {};
+    const dly = b.daily ?? {};
+    const perf = b.performance ?? {};
+    const cap = caps.startingBalance ?? 0;
+    const utilization = cap > 0 ? (t.deployed ?? 0) / cap : 0;
+    const realized = t.totalPnl ?? 0;
+    const todayPnl = dly.dailyPnl ?? 0;
+    const wlRatio = perf.winLossRatio;
+    const wlRatioStr = wlRatio == null ? '—' : `${wlRatio.toFixed(2)}×`;
+    const wlRatioClass = wlRatio == null ? 'dim' : wlRatio >= 1 ? 'green' : 'yellow';
+    const ev = modelEvByBot[b.name] ?? 0;
+    const evCount = modelEvCountByBot[b.name] ?? 0;
+
     return `
       <div class="bot-chip">
         <header>
           <h3>
             ${botTag(b.name)}
             ${b.displayName}
-            <span class="pill ${statusClass}" style="padding:2px 8px;font-size:10px"><span class="dot"></span>${statusText}</span>
+            <span class="pill ${statusClass}" style="padding:2px 8px;font-size:10px"><span class="dot"></span>${statusText} ${fmt.uptime(b.uptimeSec)}</span>
           </h3>
           <span class="pill ${killClass}" style="font-size:10px;padding:2px 8px"><span class="dot"></span>kill ${killText}</span>
         </header>
+        <!-- Headline metrics (3 prominent values) -->
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+          <div title="Cumulative realized P&L from closed trades, post-audit. Includes wins minus losses minus Kalshi fees.">
+            <div class="m-label">Realized P&amp;L</div>
+            <div style="font-size:18px;font-weight:600" class="${pnlClass(realized)}">${fmt.moneyPos(realized)}</div>
+            <div class="m-label" style="margin-top:2px">${perf.roiPct != null ? `${perf.roiPct >= 0 ? '+' : ''}${perf.roiPct.toFixed(1)}% ROI on ${fmt.money(cap)}` : ''}</div>
+          </div>
+          <div title="Win rate from closed trades.">
+            <div class="m-label">Win rate</div>
+            <div style="font-size:18px;font-weight:600">${perf.winRate == null ? '—' : fmt.pct0(perf.winRate)}</div>
+            <div class="m-label" style="margin-top:2px">${t.wins ?? 0}W · ${t.losses ?? 0}L · ${t.closedCount ?? 0} total</div>
+          </div>
+          <div title="Average win divided by average loss. Higher means each winner pays for many losers — what the ensemble strategy targets.">
+            <div class="m-label">Win / loss ratio</div>
+            <div style="font-size:18px;font-weight:600" class="${wlRatioClass}">${wlRatioStr}</div>
+            <div class="m-label" style="margin-top:2px">avg win <span class="green">+$${(perf.avgWinUSD ?? 0).toFixed(2)}</span> · loss <span class="red">$${(perf.avgLossUSD ?? 0).toFixed(2)}</span></div>
+          </div>
+        </div>
+        <!-- Detailed metrics -->
         <div class="bot-meta">
           <div>
-            <div class="m-label">PID / uptime</div>
-            <div class="m-value">${b.pid ?? '—'} · ${fmt.uptime(b.uptimeSec)}</div>
+            <div class="m-label">Today</div>
+            <div class="m-value ${pnlClass(todayPnl)}">${fmt.moneyPos(todayPnl)} · ${dly.closedToday ?? 0} closed</div>
+          </div>
+          <div title="Open positions and capital deployed vs the bankroll cap.">
+            <div class="m-label">Open</div>
+            <div class="m-value">${t.openCount ?? 0} pos · ${fmt.money(t.deployed ?? 0)} <span class="dim">(${(utilization * 100).toFixed(0)}%)</span></div>
+          </div>
+          <div title="Forward-looking: sum of model EV across this bot's open T-12h+ positions. Excludes near-close positions where forecast is stale.">
+            <div class="m-label">Model EV (open T+12h)</div>
+            <div class="m-value ${pnlClass(ev)}">${evCount > 0 ? fmt.moneyPos(ev) : '—'} <span class="dim">${evCount > 0 ? `(${evCount})` : ''}</span></div>
+          </div>
+          <div>
+            <div class="m-label">Trade rate</div>
+            <div class="m-value">${perf.tradesPerDay != null ? perf.tradesPerDay.toFixed(1) + '/day' : '—'} <span class="dim">${perf.daysSinceLaunch != null ? `over ${perf.daysSinceLaunch}d` : ''}</span></div>
           </div>
           <div>
             <div class="m-label">Strategy</div>
             <div class="m-value">${b.strategy ?? '—'}</div>
           </div>
           <div>
-            <div class="m-label">Bankroll</div>
-            <div class="m-value">${fmt.money(caps.startingBalance ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Positions</div>
-            <div class="m-value">${b.totals?.openCount ?? 0} open · ${b.totals?.closedCount ?? 0} closed</div>
-          </div>
-          <div>
-            <div class="m-label">Realized P&amp;L</div>
-            <div class="m-value ${pnlClass(b.totals?.totalPnl ?? 0)}">${fmt.moneyPos(b.totals?.totalPnl ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Daily P&amp;L</div>
-            <div class="m-value ${pnlClass(b.daily?.dailyPnl ?? null)}">${fmt.moneyPos(b.daily?.dailyPnl ?? 0)}</div>
-          </div>
-          <div>
-            <div class="m-label">Scans</div>
-            <div class="m-value">${b.totals?.scansCompleted ?? 0}</div>
-          </div>
-          <div>
-            <div class="m-label">Last saved</div>
-            <div class="m-value">${fmt.ago(b.totals?.savedAt)}</div>
-          </div>
-          <div>
-            <div class="m-label">Max positions</div>
-            <div class="m-value">${caps.maxTotalPositions ?? '—'}</div>
+            <div class="m-label">PID · last save</div>
+            <div class="m-value">${b.pid ?? '—'} · ${fmt.ago(t.savedAt)}</div>
           </div>
         </div>
       </div>
@@ -540,6 +629,8 @@ function renderPositions() {
   if (cityFilter) pos = pos.filter(p => (p.city ?? '').toLowerCase().includes(cityFilter));
   if (sideFilter !== 'all') pos = pos.filter(p => p.side === sideFilter);
   if (sort === 'closes') pos.sort((a,b) => (a.hoursToClose ?? 999) - (b.hoursToClose ?? 999));
+  else if (sort === 'ev-desc') pos.sort((a,b) => (b.expectedValueUSD ?? -9999) - (a.expectedValueUSD ?? -9999));
+  else if (sort === 'ev-asc') pos.sort((a,b) => (a.expectedValueUSD ?? 9999) - (b.expectedValueUSD ?? 9999));
   else if (sort === 'pnl-desc') pos.sort((a,b) => (b.unrealizedPnlUSD ?? 0) - (a.unrealizedPnlUSD ?? 0));
   else if (sort === 'pnl-asc') pos.sort((a,b) => (a.unrealizedPnlUSD ?? 0) - (b.unrealizedPnlUSD ?? 0));
   else if (sort === 'exposure') pos.sort((a,b) => (b.exposureUSD ?? 0) - (a.exposureUSD ?? 0));
@@ -565,9 +656,20 @@ function renderPositions() {
 
   if (pos.length === 0) { el.innerHTML = '<div class="empty">No positions match these filters</div>'; return; }
 
-  const rows = pos.map(p => `
-    <tr>
-      <td>${attributionTag(p)}</td>
+  const rows = pos.map(p => {
+    // Effective model prob — if side is NO, the winning prob is 1 - bracketHitProb
+    const winProb = p.modelProb == null ? null : (p.side === 'yes' ? p.modelProb : 1 - p.modelProb);
+    const evClass = p.expectedValueUSD == null ? 'dim' : pnlClass(p.expectedValueUSD);
+    const settle = p.settlementStatus;
+    const rowCls = settle === 'pending-win' ? 'pending-win' : settle === 'pending-loss' ? 'pending-loss' : '';
+    const settleTag = settle === 'pending-win'
+      ? '<span class="tag tag-pending-win" title="Mark ≥ $0.95 — effectively a win, awaiting Kalshi settlement">⏳ pending win</span>'
+      : settle === 'pending-loss'
+      ? '<span class="tag tag-pending-loss" title="Mark ≤ $0.05 — effectively a loss, awaiting close">⏳ pending loss</span>'
+      : '';
+    return `
+    <tr class="${rowCls}">
+      <td>${attributionTag(p)}${settleTag ? ' '+settleTag : ''}</td>
       <td><code style="font-size:11px">${p.ticker}</code></td>
       <td>${p.city ?? '—'}</td>
       <td>${p.bracketText ? '<span class="bracket">'+p.bracketText+'</span>' : '—'}</td>
@@ -577,20 +679,131 @@ function renderPositions() {
       <td class="num">$${p.markPrice.toFixed(3)}</td>
       <td class="num">${fmt.money(p.exposureUSD)}</td>
       <td class="num ${pnlClass(p.unrealizedPnlUSD)}">${fmt.moneyPos(p.unrealizedPnlUSD)}</td>
+      <td class="num ${winProb == null ? 'dim' : ''}">${winProb == null ? '—' : fmt.pct0(winProb)}</td>
+      <td class="num ${evClass}">${fmt.moneyPos(p.expectedValueUSD ?? null)}</td>
       <td class="num dim">${fmt.hours(p.hoursToClose)}</td>
     </tr>
-  `).join('');
+  `;}).join('');
 
   el.innerHTML = `
     <table>
       <thead><tr>
         <th>Bot</th><th>Ticker</th><th>City</th><th>Bracket</th><th>Side</th>
         <th class="num">Shares</th><th class="num">Avg</th><th class="num">Mark</th>
-        <th class="num">Cost</th><th class="num">Unreal. P&amp;L</th><th class="num">Closes</th>
+        <th class="num">Cost</th><th class="num">Unreal.</th>
+        <th class="num" title="Model probability this position wins">Win prob</th>
+        <th class="num" title="Expected P&L on resolution, net of Kalshi 7% winnings fee">Exp. P&amp;L</th>
+        <th class="num">Closes</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
+}
+
+// ─── Forecast coverage on open positions ─────────────────────────────
+// One card per (city, date) that we have positions on. Each card shows:
+//   - Ensemble mean ± stddev (with p10-p90 range)
+//   - Every position we hold on that market, with modelProb + winProb + EV
+//   - A small bar indicating whether the ensemble mean falls INSIDE our bracket
+function renderCoverage() {
+  const el = document.getElementById('coverage-body');
+  const countEl = document.getElementById('coverage-count');
+  const withForecast = app.positions.filter(p => p.forecast && p.modelProb != null);
+
+  if (withForecast.length === 0) {
+    countEl.textContent = '';
+    el.innerHTML = '<div class="empty">No open positions with forecast data</div>';
+    return;
+  }
+
+  // Group by eventTicker (= one Kalshi market event = one (city, date) pair)
+  const groups = new Map();
+  for (const p of withForecast) {
+    const key = p.eventTicker || (p.city + '-' + (p.closeTime ?? ''));
+    if (!groups.has(key)) {
+      groups.set(key, {
+        eventTicker: p.eventTicker,
+        city: p.city,
+        closeTime: p.closeTime,
+        hoursToClose: p.hoursToClose,
+        forecast: p.forecast, // same ensemble for all positions in this event
+        positions: [],
+      });
+    }
+    groups.get(key).positions.push(p);
+  }
+
+  countEl.textContent = `(${groups.size} market${groups.size === 1 ? '' : 's'})`;
+
+  const cards = [];
+  const groupArr = Array.from(groups.values()).sort((a, b) => (a.hoursToClose ?? 999) - (b.hoursToClose ?? 999));
+
+  for (const g of groupArr) {
+    const f = g.forecast;
+    const totalExp = g.positions.reduce((s, p) => s + (p.exposureUSD ?? 0), 0);
+    const totalEV = g.positions.reduce((s, p) => s + (p.expectedValueUSD ?? 0), 0);
+
+    // Ranges for the forecast bar (use p10-p90 as visual extent)
+    const lo = Math.min(f.p10 - 1, ...g.positions.map(p => p.bracketRange?.lowF ?? f.p10).filter(isFinite));
+    const hi = Math.max(f.p90 + 1, ...g.positions.map(p => p.bracketRange?.highF ?? f.p90).filter(isFinite));
+    const span = Math.max(1, hi - lo);
+    const pct = v => Math.max(0, Math.min(100, ((v - lo) / span) * 100));
+
+    const posRows = g.positions.map(p => {
+      const win = p.side === 'yes' ? p.modelProb : 1 - p.modelProb;
+      const r = p.bracketRange;
+      const inBracket = r && f.mean >= (r.lowF ?? -Infinity) && f.mean <= (r.highF ?? Infinity);
+      const barStyle = r
+        ? `position:absolute;top:0;height:100%;left:${pct(isFinite(r.lowF) ? r.lowF : lo)}%;width:${pct(isFinite(r.highF) ? r.highF : hi) - pct(isFinite(r.lowF) ? r.lowF : lo)}%;background:${inBracket ? 'rgba(46,204,113,0.22)' : 'rgba(243,156,18,0.18)'};border:1px solid ${inBracket ? 'rgba(46,204,113,0.5)' : 'rgba(243,156,18,0.45)'};border-radius:3px`
+        : '';
+      return `
+        <tr>
+          <td>${attributionTag(p)}</td>
+          <td><span class="bracket">${p.bracketText || '—'}</span> ${sideTag(p.side)}</td>
+          <td class="num">${p.shares.toFixed(0)}sh @ $${p.avgEntryPrice.toFixed(3)}</td>
+          <td class="num">${fmt.pct0(win)}</td>
+          <td class="num ${pnlClass(p.expectedValueUSD)}">${fmt.moneyPos(p.expectedValueUSD)}</td>
+          <td>
+            <div style="position:relative;height:14px;background:var(--bg-input);border-radius:3px;border:1px solid var(--border);overflow:hidden">
+              <div style="${barStyle}"></div>
+              <div title="ensemble mean" style="position:absolute;top:0;height:100%;left:calc(${pct(f.mean)}% - 1px);width:2px;background:#4c7dff"></div>
+              <div title="p10" style="position:absolute;top:3px;height:8px;left:calc(${pct(f.p10)}% - 0.5px);width:1px;background:rgba(76,125,255,0.4)"></div>
+              <div title="p90" style="position:absolute;top:3px;height:8px;left:calc(${pct(f.p90)}% - 0.5px);width:1px;background:rgba(76,125,255,0.4)"></div>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+
+    cards.push(`
+      <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:10px;background:var(--bg-elev)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+          <div>
+            <div style="font-size:13px;font-weight:600">${g.city ?? '?'} <span class="dim" style="font-weight:400;font-size:12px">· ${g.eventTicker ?? ''}</span></div>
+            <div class="dim" style="font-size:11px;margin-top:2px">Closes ${fmt.iso2local(g.closeTime)} · ${fmt.hours(g.hoursToClose)} away</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:13px"><span class="cyan">${fmt.temp(f.mean)}</span> <span class="dim">±${f.stddev.toFixed(1)}°</span></div>
+            <div class="dim" style="font-size:11px">p10 ${fmt.temp(f.p10)} · p90 ${fmt.temp(f.p90)}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="dim" style="font-size:10px;text-transform:uppercase;letter-spacing:0.05em">Total</div>
+            <div style="font-size:13px">${fmt.money(totalExp)} in · <span class="${pnlClass(totalEV)}">${fmt.moneyPos(totalEV)}</span> EV</div>
+          </div>
+        </div>
+        <table style="font-size:12px">
+          <thead><tr>
+            <th></th><th>Bracket</th><th class="num">Shares @ entry</th>
+            <th class="num">Win prob</th><th class="num">Exp. P&amp;L</th>
+            <th style="width:35%">Forecast (blue=ensemble · green=in bracket · amber=outside)</th>
+          </tr></thead>
+          <tbody>${posRows}</tbody>
+        </table>
+      </div>
+    `);
+  }
+
+  el.innerHTML = cards.join('');
 }
 
 // ─── Orders table ─────────────────────────────────────────────────────
@@ -795,6 +1008,7 @@ async function refreshAll() {
   renderTopCards();
   renderBotRow();
   renderPositions();
+  renderCoverage();
   renderOrders();
   renderEquity();
 }
